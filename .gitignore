@@ -209,3 +209,6 @@ __marimo__/
 # Asset Discovery Bot
 build.log
 /volume1/
+
+# Docker secrets — never commit these
+secrets/

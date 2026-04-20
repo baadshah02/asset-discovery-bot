@@ -76,11 +76,13 @@ services:
       # or a docker-compose.override.yml; intentionally empty here.
       {}
     volumes:
-      # Read-only config mount (Req 6.1): the YAML lives on the host and
-      # is mounted into the container at the canonical path expected by
-      # bot.config.load_config.
-      - type: volume
-        source: config
+      # Read-only config mount (Req 6.1): the YAML lives on the host under
+      # ./config/ and is mounted into the container at the canonical path
+      # expected by bot.config.load_config. Bind-mount (rather than a
+      # named Docker volume) so operators can edit config.yaml directly
+      # without a one-shot `docker cp` seed step.
+      - type: bind
+        source: ./config
         target: /app/config
         read_only: true
       # Log output directory; matches LoggingConfig.log_dir default.
@@ -89,6 +91,7 @@ services:
       # Req 9.8: all three secrets are mounted at /run/secrets/<name>.
       - fmp_api_key
       - db_password
+      - db_url
       - discord_webhook_url
     networks:
       - internal
@@ -105,13 +108,14 @@ secrets:
     file: ./secrets/fmp_api_key.txt
   db_password:
     file: ./secrets/db_password.txt
+  db_url:
+    file: ./secrets/db_url.txt
   discord_webhook_url:
     file: ./secrets/discord_webhook_url.txt
 
 volumes:
   pgdata:
   logs:
-  config:
 
 networks:
   internal:
