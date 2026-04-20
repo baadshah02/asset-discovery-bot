@@ -1,0 +1,52 @@
+# Keep the build context lean so `docker build` transfers only what's needed.
+
+# Version control / Kiro metadata
+.git
+.gitignore
+.kiro
+
+# Python build / cache artifacts
+__pycache__
+*.py[cod]
+*.pyo
+*$py.class
+*.egg-info
+.eggs
+build
+dist
+.Python
+
+# Virtual environments
+.venv
+venv
+env
+ENV
+
+# Test / type-checker / linter caches
+.pytest_cache
+.hypothesis
+.mypy_cache
+.ruff_cache
+.coverage
+.coverage.*
+htmlcov
+coverage.xml
+
+# Editor / OS cruft
+.vscode
+.idea
+.DS_Store
+Thumbs.db
+
+# Tests are not needed in the runtime image
+tests
+
+# Dev-only dependency manifest
+requirements-dev.txt
+
+# Local logs and Synology host-mount fixtures
+build.log
+/volume1
+
+# Docs kept out of the runtime image
+README.md

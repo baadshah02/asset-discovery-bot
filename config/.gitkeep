@@ -1,0 +1,1 @@
+# Keep the config/ directory in version control. Real config.yaml is mounted at runtime.

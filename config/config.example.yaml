@@ -1,0 +1,85 @@
+# Asset Discovery Bot — example configuration
+#
+# Copy this file to config.yaml (mounted into the bot container at
+# /app/config/config.yaml) and edit values as needed. Every field is
+# validated by bot.config.AppConfig on startup; invalid values cause
+# the bot to exit non-zero before any I/O (Req 6.4, 11.12).
+#
+# Secrets (db URL, FMP API key, Discord webhook URL) are NEVER placed
+# here. They live in /run/secrets/* and are loaded by bot.config.Secrets.
+# Do NOT commit any real API key, webhook URL, or database credential.
+#
+# Precedence (highest wins):
+#   1. Environment variable ADB_<SECTION>__<FIELD>
+#   2. This YAML file
+#   3. Pydantic field default
+
+# --- Filter layer thresholds ---
+
+layer1:
+  # 52-Week Low Anchor (George & Hwang, 2004).
+  # Candidate's close must sit within this range above its 52-week low.
+  pct_above_low_min: 0.05       # inclusive lower bound (5%)
+  pct_above_low_max: 0.15       # inclusive upper bound (15%)
+
+layer2:
+  # RSI capitulation crossover.
+  # Yesterday's RSI must be strictly below `rsi_oversold` AND today's must
+  # be strictly above `rsi_recovery`. Independent thresholds permit a
+  # buffered crossover (e.g., 28 → 32) for stricter signals.
+  rsi_period: 14
+  rsi_oversold: 30.0
+  rsi_recovery: 30.0
+
+layer3:
+  # Fama-French Value (HML proxy): current P/E must be below the ticker's
+  # own 5-year average P/E. If `require_positive_earnings` is true, both
+  # P/Es must also be strictly positive (negative-earnings firms excluded).
+  require_positive_earnings: true
+
+layer4:
+  # Fama-French Quality / QMJ: FCF yield floor.
+  fcf_yield_min: 0.045          # 4.5%
+
+# --- Infrastructure / operational tunables ---
+
+cache:
+  # Days a `fundamentals_cache` row is considered fresh before the Bot
+  # refetches from FMP. Must be in [1, 90].
+  fundamentals_staleness_days: 7
+
+universe:
+  # Sanity bounds: if Wikipedia scrape returns a count outside this range,
+  # the run aborts without mutating asset_universe (Req 1.6, 8.1).
+  min_constituent_count: 450
+  max_constituent_count: 520
+  source_url: "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+
+notification:
+  # Discord webhook retry budget for 429 / 5xx responses.
+  max_retries: 5
+  backoff_initial_seconds: 1.0
+  backoff_max_seconds: 60.0
+  bot_username: "Asset Discovery Bot"
+
+fmp:
+  # Financial Modeling Prep client tuning. The free tier allows 250
+  # calls/day; the soft cap here triggers a WARN log line earlier so
+  # operators notice budget pressure before FMP starts returning 429.
+  base_url: "https://financialmodelingprep.com/api/v3"
+  timeout_seconds: 10.0
+  max_daily_calls_soft_cap: 200
+
+yfinance:
+  # Batch-download tuning for the yfinance adapter.
+  history_period: "1y"
+  batch_size: 100
+  retries_per_ticker: 3
+
+logging:
+  # Rotating file log configuration. `log_dir` should correspond to the
+  # `logs` volume mount declared in docker-compose.yml.
+  level: "INFO"
+  log_dir: "/var/log/asset-discovery-bot"
+  max_file_size_mb: 10
+  backup_count: 7

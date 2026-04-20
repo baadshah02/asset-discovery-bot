@@ -1,0 +1,118 @@
+# Asset Discovery Bot — Docker Compose definition
+#
+# Defines the two-service topology used by the bot:
+#   - db:  PostgreSQL 15-alpine, hard-capped at 512 MB RAM.
+#   - bot: The Python 3.11-slim container built from ./Dockerfile. Batch
+#          process; invoked via `docker compose run --rm bot ...` on a
+#          scheduler (Synology Task Scheduler / cron / systemd timer).
+#
+# Requirements traceability:
+#   - 9.2  Postgres container configured with mem_limit: 512m.
+#   - 9.6  Neither service declares a host port (no `ports:` key anywhere);
+#          the bot opens only outbound connections.
+#   - 9.7  Postgres is attached to the internal bridge network only and is
+#          not bound to any host port.
+#   - 9.8  All secret material is delivered via Docker secrets and mounted
+#          at /run/secrets/<name>; no secret is passed via environment or
+#          image layer.
+#
+# Notes:
+#   - The modern Compose spec omits the top-level `version:` field.
+#   - Healthcheck + `depends_on.condition: service_healthy` are added by
+#     Task 2.4; this file uses a plain `depends_on: [db]` for now.
+#   - The Postgres superuser password is read from the db_password secret
+#     file via POSTGRES_PASSWORD_FILE (the postgres image supports *_FILE
+#     variants natively), satisfying Req 9.8.
+#   - Named volumes `pgdata`, `logs`, and `config` are defined here as
+#     plain Docker-managed volumes. Task 19's README documents how to map
+#     them onto host bind mounts under /volume1/docker/asset-discovery-bot/
+#     on a Synology DS220+.
+
+services:
+  db:
+    image: postgres:15-alpine
+    restart: unless-stopped
+    # Req 9.2: hard-cap Postgres memory at 512 MB.
+    mem_limit: 512m
+    environment:
+      POSTGRES_USER: adb
+      POSTGRES_DB: asset_discovery_bot
+      # Req 9.8: password is read from the mounted secret file, not env.
+      POSTGRES_PASSWORD_FILE: /run/secrets/db_password
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    secrets:
+      - db_password
+    networks:
+      - internal
+    # Healthcheck (Req 7.1, 8.5): the bot waits for Postgres to accept
+    # connections before starting. `pg_isready` queries the postmaster
+    # via the local socket; we pass -U/-d so it matches the role and
+    # database that the bot will actually use.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U adb -d asset_discovery_bot"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    # Req 9.7: deliberately NO `ports:` key — Postgres is reachable only
+    # from the `bot` service over the internal bridge network.
+
+  bot:
+    build: .
+    # The bot is a batch process that exits after each scan; it is driven
+    # by the host scheduler via `docker compose run --rm bot python -m bot.run`.
+    # `restart: "no"` prevents the container from being resurrected after a
+    # successful exit.
+    restart: "no"
+    depends_on:
+      # Req 8.5: the orchestrator must not start until Postgres is
+      # accepting connections, per the healthcheck above.
+      db:
+        condition: service_healthy
+    environment:
+      # Placeholder for ADB_* overrides (see bot.config precedence rules).
+      # Real overrides are added per-invocation via `docker compose run -e ...`
+      # or a docker-compose.override.yml; intentionally empty here.
+      {}
+    volumes:
+      # Read-only config mount (Req 6.1): the YAML lives on the host and
+      # is mounted into the container at the canonical path expected by
+      # bot.config.load_config.
+      - type: volume
+        source: config
+        target: /app/config
+        read_only: true
+      # Log output directory; matches LoggingConfig.log_dir default.
+      - logs:/var/log/asset-discovery-bot
+    secrets:
+      # Req 9.8: all three secrets are mounted at /run/secrets/<name>.
+      - fmp_api_key
+      - db_password
+      - discord_webhook_url
+    networks:
+      - internal
+    # Req 9.6: no `ports:` key — the bot makes only outbound HTTPS calls.
+
+# One-shot operational commands (documented; not executed automatically):
+#   Apply database migrations:
+#     docker compose run --rm bot python -m bot.migrations.run_migrations
+#   Run one scan:
+#     docker compose run --rm bot python -m bot.run
+
+secrets:
+  fmp_api_key:
+    file: ./secrets/fmp_api_key.txt
+  db_password:
+    file: ./secrets/db_password.txt
+  discord_webhook_url:
+    file: ./secrets/discord_webhook_url.txt
+
+volumes:
+  pgdata:
+  logs:
+  config:
+
+networks:
+  internal:
+    driver: bridge
