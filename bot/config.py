@@ -215,12 +215,17 @@ class Secrets(BaseModel):
     The ``__repr__`` / ``__str__`` overrides guarantee that accidental
     ``print(secrets)``, ``logger.info("cfg=%r", secrets)``, or traceback
     rendering never leaks credential material (Requirements 5.7, 6.6, 9.8).
+
+    ``fmp_api_key`` is optional as of the EDGAR migration — the
+    fundamentals adapter no longer needs an FMP key. The field remains
+    so existing secret files keep working; a missing or empty
+    ``fmp_api_key`` file no longer aborts startup.
     """
 
     model_config = {"frozen": True}
 
     db_url: str
-    fmp_api_key: str
+    fmp_api_key: str = ""  # optional; unused by the EDGAR adapter
     discord_webhook_url: str
 
     def __repr__(self) -> str:
@@ -290,18 +295,25 @@ def _env_overrides(env: dict[str, str]) -> dict[str, Any]:
     return result
 
 
-def _read_secret(secrets_dir: Path, field_name: str, file_name: str) -> str:
-    """Read one secret file. Raises without echoing the secret value."""
+def _read_secret(
+    secrets_dir: Path,
+    field_name: str,
+    file_name: str,
+    required: bool = True,
+) -> str:
+    """Read one secret file. Empty/missing raises unless ``required`` is False."""
     path = secrets_dir / file_name
     if not path.is_file():
+        if not required:
+            return ""
         raise FileNotFoundError(
             f"Required secret file is missing: field={field_name} "
             f"path={path}"
         )
-    # ``errors="strict"`` so a corrupted file fails loudly rather than silently
-    # returning partial bytes.
     content = path.read_text(encoding="utf-8").strip()
     if not content:
+        if not required:
+            return ""
         raise ValueError(
             f"Required secret file is empty: field={field_name} path={path}"
         )
@@ -347,8 +359,17 @@ def load_config(
     app_config = AppConfig.model_validate(merged)
 
     # Step 4 + 5: read + validate secrets
+    # ``fmp_api_key`` is no longer strictly required (EDGAR migration);
+    # read it if present so existing deployments keep working but don't
+    # abort when the file is missing.
+    _OPTIONAL_SECRETS = {"fmp_api_key"}
     secret_values: dict[str, str] = {
-        field_name: _read_secret(secrets_dir, field_name, file_name)
+        field_name: _read_secret(
+            secrets_dir,
+            field_name,
+            file_name,
+            required=field_name not in _OPTIONAL_SECRETS,
+        )
         for field_name, file_name in _SECRET_FILENAMES.items()
     }
     secrets = Secrets.model_validate(secret_values)

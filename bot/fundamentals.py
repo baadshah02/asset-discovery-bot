@@ -1,502 +1,644 @@
-"""Fundamentals_Service: cache-gated FMP adapter for the Asset Discovery Bot.
+"""Fundamentals_Service: cache-gated EDGAR + yfinance adapter.
 
-This module implements Component 3 of the design (`bot.fundamentals`). It is
-the **only** code path that talks to Financial Modeling Prep, and every call
-is gated by a local ``fundamentals_cache`` lookup so a warm cache keeps the
-bot well inside the FMP free-tier budget (250 calls/day).
+Replaces the original FMP adapter. Sources now:
 
-High-level contract
--------------------
+* **SEC EDGAR CompanyFacts API** — authoritative US GAAP XBRL. Free,
+  no key, 10 req/sec rate limit.
+* **yfinance** — current price, 6y historical closes for 5y P/E
+  derivation, latest news headline.
 
-* :class:`FmpClient` wraps the four FMP endpoints consumed by the bot:
-  ``/ratios/{ticker}``, ``/cash-flow-statement-ttm/{ticker}``,
-  ``/profile/{ticker}``, and ``/press-releases/{ticker}``. Transport errors
-  and 5xx responses are retried with ``tenacity`` exponential backoff; other
-  4xx responses propagate unchanged.
-* :func:`get_fundamentals` first consults :meth:`Repository.load_fundamentals`.
-  A row whose ``fetched_at`` is within ``staleness_days`` is returned
-  verbatim (Requirement 3.2). Only on a cache miss or stale row does the
-  client actually call FMP, upsert the fresh row, and return it
-  (Requirement 3.3).
-* ``pe_5y_avg`` is derived as the arithmetic mean of ``priceEarningsRatio``
-  across the most recent five annual ``/ratios`` entries (Requirement 3.5).
-  ``fcf_yield = ttm_fcf / market_cap`` is computed only when ``market_cap``
-  is strictly positive; otherwise it is persisted as ``None``
-  (Requirement 3.4).
+Derived fields:
 
-FMP 429 kill-switch semantics
------------------------------
+* ``pe_ratio``        = current_price / TTM diluted EPS
+* ``pe_5y_avg``       = mean of (close_at_fy_end / fy_eps) over 5 years
+* ``fcf_yield``       = TTM (OpCashFlow - |CapEx|) / market_cap
+* ``market_cap``      = shares_outstanding * current_price
+* ``latest_headline`` = first ``yfinance.Ticker(t).news`` entry
 
-Each :class:`FmpClient` instance owns a run-scoped ``budget_exhausted``
-flag. The first HTTP 429 response flips that flag to ``True`` and raises
-:class:`FmpBudgetExhausted`. Every subsequent call on the same client
-short-circuits to ``FmpBudgetExhausted`` **without** touching the network
-(Requirements 3.7, 8.3). The orchestrator is expected to treat this as
-"continue Layers 3/4 using only L2 survivors whose fundamentals are already
-cached" and skip the rest — the translation from kill-switch to that
-policy lives in :func:`get_fundamentals` and in the caller.
-
-Call counter (Task 8.3)
------------------------
-
-The client also owns a run-scoped ``call_count`` that increments on every
-outbound HTTP request (including the one that triggers the kill-switch).
-This exposes the invariant in Requirement 11.4 / 9.5 — total FMP calls in
-a run must be bounded by ``3 × N`` where ``N`` is the count of L2 survivors
-that were cache-miss or cache-stale. The orchestrator logs the final value,
-and the property-based test in task 8.6 reads it directly from the client.
+Cache semantics and the budget-exhausted stale-cache fallback from the
+FMP era are preserved. ``FmpClient``/``FmpBudgetExhausted`` remain as
+aliases so the orchestrator works unchanged.
 """
 
 from __future__ import annotations
 
 import logging
 import math
-from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
-from typing import Any, Callable, Iterable
+from datetime import date, datetime, timedelta, timezone
+from statistics import mean
+from typing import Any, Iterable
 
 import requests
-from tenacity import (
-    retry,
-    retry_if_exception,
-    stop_after_attempt,
-    wait_exponential,
-)
+import yfinance as yf
 
 from bot.config import FmpConfig
-
-# Re-exported for caller convenience. :class:`Fundamentals` is defined in
-# :mod:`bot.repo` so the repository module has no upward imports from this
-# module; importing it here and listing it in ``__all__`` preserves the
-# historical call site ``from bot.fundamentals import Fundamentals``.
-from bot.repo import Fundamentals, Repository  # noqa: F401 — re-exported
+from bot.repo import Fundamentals, Repository  # noqa: F401
 
 __all__ = [
     "Fundamentals",
+    "FundamentalsBudgetExhausted",
+    "FundamentalsClient",
     "FmpBudgetExhausted",
     "FmpClient",
     "get_fundamentals",
 ]
 
-
 _log = logging.getLogger(__name__)
 
-
-# ---------------------------------------------------------------------------
-# Exceptions
-# ---------------------------------------------------------------------------
-
-
-class FmpBudgetExhausted(Exception):
-    """Raised when the FMP 429 kill-switch has fired for this run.
-
-    The first HTTP 429 response sets :attr:`FmpClient.budget_exhausted` to
-    ``True`` and raises this exception. Every subsequent :class:`FmpClient`
-    method call short-circuits to the same exception without issuing a
-    network request. :func:`get_fundamentals` catches it and falls back to
-    stale cache when available (Requirement 8.3).
-    """
+# The SEC asks every CompanyFacts consumer to identify themselves in the
+# User-Agent. Requests without a recognisable UA return 403.
+_EDGAR_UA = "asset-discovery-bot bot@asset-discovery-bot.local"
 
 
-# ---------------------------------------------------------------------------
-# Tenacity retry predicate
-# ---------------------------------------------------------------------------
+class FundamentalsBudgetExhausted(Exception):
+    """Unrecoverable fundamentals failure for the remainder of this run."""
 
 
-# tenacity predicates should be cheap; we keep this as a module-level
-# callable so the retry decorator can be reused across methods.
-def _retry_on_transient(exc: BaseException) -> bool:
-    """Retry predicate: retry transport errors and 5xx; never retry 429/4xx.
-
-    ``FmpBudgetExhausted`` is explicitly NOT retried because it represents
-    a terminal run-scoped condition. HTTP 4xx responses other than 429
-    (handled separately inside the methods) also propagate immediately —
-    retrying a 404 or 401 only wastes budget.
-    """
-    if isinstance(exc, FmpBudgetExhausted):
-        return False
-    if isinstance(exc, (requests.ConnectionError, requests.Timeout)):
-        return True
-    if isinstance(exc, requests.HTTPError):
-        response = exc.response
-        if response is None:
-            return True
-        return 500 <= response.status_code < 600
-    return False
-
-
-# ---------------------------------------------------------------------------
-# Helpers — numeric coercion and pe_5y_avg derivation
-# ---------------------------------------------------------------------------
+# Legacy alias — orchestrator imports ``FmpBudgetExhausted``.
+FmpBudgetExhausted = FundamentalsBudgetExhausted
 
 
 def _parse_float(value: Any) -> float | None:
-    """Coerce ``value`` to ``float`` or return ``None`` on failure/NaN.
-
-    FMP payloads occasionally contain ``None``, the literal string
-    ``"None"``, empty strings, or quoted numerics. A single tolerant
-    coercion keeps the call sites readable.
-    """
-    if value is None:
-        return None
-    if isinstance(value, bool):
-        # ``bool`` is a subtype of ``int`` in Python; guard against silently
-        # coercing ``True`` to 1.0.
+    """Coerce to a finite float, else None. Tolerant of FMP/XBRL quirks."""
+    if value is None or isinstance(value, bool):
         return None
     if isinstance(value, (int, float)):
-        as_float = float(value)
-        if math.isnan(as_float) or math.isinf(as_float):
-            return None
-        return as_float
+        out = float(value)
+        return None if (math.isnan(out) or math.isinf(out)) else out
     if isinstance(value, str):
-        stripped = value.strip()
-        if not stripped or stripped.lower() == "none":
+        s = value.strip()
+        if not s or s.lower() in {"none", "nan"}:
             return None
         try:
-            as_float = float(stripped)
+            out = float(s)
         except ValueError:
             return None
-        if math.isnan(as_float) or math.isinf(as_float):
-            return None
-        return as_float
+        return None if (math.isnan(out) or math.isinf(out)) else out
     return None
 
 
-def _first_not_none(payload: dict[str, Any], keys: Iterable[str]) -> Any:
-    """Return the first non-None value found under any of ``keys``.
+# ---------------------------------------------------------------------------
+# SEC EDGAR — ticker -> CIK lookup (process-wide cache) and CompanyFacts
+# ---------------------------------------------------------------------------
 
-    FMP field names drift between endpoint versions (for example the P/E
-    field appears as ``priceEarningsRatio`` on the annual ``/ratios``
-    endpoint but as ``peRatio`` on some historical slices). Callers pass
-    the preferred key first.
-    """
-    for key in keys:
-        if key in payload and payload[key] is not None:
-            return payload[key]
+
+_TICKER_CIK_MAP: dict[str, str] | None = None
+
+
+def _load_ticker_cik_map() -> dict[str, str]:
+    """Fetch the SEC ticker -> CIK table once per process."""
+    global _TICKER_CIK_MAP
+    if _TICKER_CIK_MAP is not None:
+        return _TICKER_CIK_MAP
+    resp = requests.get(
+        "https://www.sec.gov/files/company_tickers.json",
+        timeout=10.0,
+        headers={"User-Agent": _EDGAR_UA},
+    )
+    resp.raise_for_status()
+    raw = resp.json()
+    result: dict[str, str] = {}
+    for entry in raw.values():
+        ticker = str(entry.get("ticker", "")).upper()
+        cik = entry.get("cik_str")
+        if ticker and cik is not None:
+            result[ticker] = str(cik).zfill(10)
+    _TICKER_CIK_MAP = result
+    _log.info("Loaded SEC ticker->CIK map: %d entries", len(result))
+    return result
+
+
+def _cik_from_ticker(ticker: str) -> str | None:
+    """Map Wikipedia-style ``BRK.B`` to the SEC's 10-digit CIK."""
+    mapping = _load_ticker_cik_map()
+    upper = ticker.upper()
+    for candidate in (upper, upper.replace(".", "-"), upper.replace(".", "")):
+        cik = mapping.get(candidate)
+        if cik:
+            return cik
     return None
 
 
-def _pe_5y_avg(ratios_list: list[dict[str, Any]]) -> float | None:
-    """Arithmetic mean of per-year P/E across the most recent five entries.
-
-    Implements Requirement 3.5. The ``/ratios/{ticker}`` endpoint returns
-    annual rows ordered newest-first; we slice the first five, coerce each
-    ``priceEarningsRatio`` (falling back to ``peRatio``) to ``float``, drop
-    ``None`` values, and return the mean. If fewer than one non-null P/E
-    survives, we return ``None`` rather than inventing a number.
-    """
-    pe_values: list[float] = []
-    for entry in ratios_list[:5]:
-        pe = _parse_float(_first_not_none(entry, ("priceEarningsRatio", "peRatio")))
-        if pe is not None:
-            pe_values.append(pe)
-    if not pe_values:
+def _edgar_company_facts(cik: str) -> dict[str, Any] | None:
+    """Fetch CompanyFacts JSON for one CIK. Returns None on any failure."""
+    url = f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
+    try:
+        resp = requests.get(
+            url,
+            timeout=15.0,
+            headers={"User-Agent": _EDGAR_UA, "Accept": "application/json"},
+        )
+    except (requests.ConnectionError, requests.Timeout) as exc:
+        _log.warning("EDGAR transport error for CIK %s: %s", cik, exc)
         return None
-    return sum(pe_values) / len(pe_values)
+    if resp.status_code == 404:
+        _log.info("EDGAR has no CompanyFacts for CIK %s", cik)
+        return None
+    if not resp.ok:
+        _log.warning("EDGAR returned HTTP %d for CIK %s", resp.status_code, cik)
+        return None
+    try:
+        return resp.json()
+    except ValueError as exc:
+        _log.warning("EDGAR returned unparseable JSON for CIK %s: %s", cik, exc)
+        return None
 
 
 # ---------------------------------------------------------------------------
-# FmpClient (Task 8.1 + 8.3)
+# XBRL concept extraction
 # ---------------------------------------------------------------------------
 
 
-class FmpClient:
-    """Thin ``requests`` wrapper around the four FMP endpoints we consume.
+# Some filers use historical-alias concept names; we try candidates in
+# order and use the first that returns non-empty data.
+_CONCEPT_EPS_DILUTED = ("EarningsPerShareDiluted",)
+_CONCEPT_OPERATING_CASH_FLOW = (
+    "NetCashProvidedByUsedInOperatingActivities",
+    "NetCashProvidedByOperatingActivities",
+)
+_CONCEPT_CAPEX = (
+    "PaymentsToAcquirePropertyPlantAndEquipment",
+    "PaymentsToAcquireProductiveAssets",
+)
+_CONCEPT_SHARES_OUTSTANDING = (
+    "CommonStockSharesOutstanding",
+    "dei:EntityCommonStockSharesOutstanding",
+)
 
-    The client is intentionally stateless with respect to tickers — all
-    per-ticker caching lives in :func:`get_fundamentals` against
-    :class:`Repository`. The only state held here is run-scoped:
 
-    * :attr:`call_count` — monotonically increasing counter of outbound
-      HTTP attempts (Task 8.3 / Requirement 11.4).
-    * :attr:`budget_exhausted` — becomes ``True`` the first time FMP
-      returns HTTP 429, at which point every further method call raises
-      :class:`FmpBudgetExhausted` without touching the network
-      (Requirement 3.7 / 8.3).
+def _facts_for_concept(
+    company_facts: dict[str, Any],
+    concept_candidates: Iterable[str],
+) -> list[dict[str, Any]]:
+    """Return entries for the first concept that resolves (us-gaap, then dei).
 
-    A fresh :class:`FmpClient` is instantiated per Scan_Run by the
-    orchestrator; the counter and flag therefore reset naturally between
-    runs without any manual teardown.
+    CompanyFacts layout::
+
+        { "facts": { "us-gaap": { "<Concept>": { "units": { "USD": [...] } } } } }
+
+    ``dei:Foo`` in the candidate list forces that taxonomy. All unit
+    variants are flattened; the caller already knows which concept they
+    asked for and hence which unit to expect.
+    """
+    facts_root = company_facts.get("facts") or {}
+    taxonomies = ("us-gaap", "dei")
+    for concept in concept_candidates:
+        if ":" in concept:
+            taxonomy, stripped = concept.split(":", 1)
+            scopes = ((taxonomy, stripped),)
+        else:
+            scopes = tuple((tax, concept) for tax in taxonomies)
+        for taxonomy, concept_name in scopes:
+            block = (facts_root.get(taxonomy) or {}).get(concept_name) or {}
+            units = block.get("units") or {}
+            for entries in units.values():
+                if entries:
+                    return list(entries)
+    return []
+
+
+def _latest_quarterly(entries: list[dict[str, Any]], n: int) -> list[dict[str, Any]]:
+    """Newest-first ``n`` entries deduped on ``end`` (amendments preserved)."""
+    filtered = [e for e in entries if e.get("fp") in {"Q1", "Q2", "Q3", "FY"}]
+    filtered.sort(
+        key=lambda e: (str(e.get("end", "")), str(e.get("filed", ""))),
+        reverse=True,
+    )
+    seen: set[str] = set()
+    deduped: list[dict[str, Any]] = []
+    for entry in filtered:
+        end = str(entry.get("end", ""))
+        if end in seen:
+            continue
+        seen.add(end)
+        deduped.append(entry)
+    return deduped[:n]
+
+
+def _ttm_sum(entries: list[dict[str, Any]]) -> float | None:
+    """Sum the ``val`` across 4 newest quarters; None if <4 quarters."""
+    quarters = _latest_quarterly(entries, n=4)
+    if len(quarters) < 4:
+        return None
+    values = [_parse_float(q.get("val")) for q in quarters]
+    if any(v is None for v in values):
+        return None
+    return float(sum(v for v in values if v is not None))
+
+
+def _ttm_eps(eps_entries: list[dict[str, Any]]) -> float | None:
+    """TTM diluted EPS: prefer newest FY, else sum of 4 newest quarters."""
+    if not eps_entries:
+        return None
+    quarters = _latest_quarterly(eps_entries, n=4)
+    if not quarters:
+        return None
+    if quarters[0].get("fp") == "FY":
+        return _parse_float(quarters[0].get("val"))
+    if len(quarters) < 4:
+        return None
+    values = [_parse_float(q.get("val")) for q in quarters]
+    if any(v is None for v in values):
+        return None
+    return float(sum(v for v in values if v is not None))
+
+
+def _annual_eps_by_fy(eps_entries: list[dict[str, Any]]) -> dict[int, float]:
+    """Map fiscal year -> FY diluted EPS. Last restatement wins."""
+    result: dict[int, float] = {}
+    for entry in eps_entries:
+        if entry.get("fp") != "FY":
+            continue
+        fy = entry.get("fy")
+        val = _parse_float(entry.get("val"))
+        if fy is None or val is None:
+            continue
+        result[int(fy)] = val
+    return result
+
+
+# ---------------------------------------------------------------------------
+# SEC EDGAR — ticker -> CIK lookup (process cache) and CompanyFacts fetch
+# ---------------------------------------------------------------------------
+
+
+_TICKER_CIK_MAP: dict[str, str] | None = None
+
+
+def _load_ticker_cik_map() -> dict[str, str]:
+    """Fetch the SEC ticker -> CIK table once per process."""
+    global _TICKER_CIK_MAP
+    if _TICKER_CIK_MAP is not None:
+        return _TICKER_CIK_MAP
+    resp = requests.get(
+        "https://www.sec.gov/files/company_tickers.json",
+        timeout=10.0,
+        headers={"User-Agent": _EDGAR_UA},
+    )
+    resp.raise_for_status()
+    raw = resp.json()
+    result: dict[str, str] = {}
+    for entry in raw.values():
+        ticker = str(entry.get("ticker", "")).upper()
+        cik = entry.get("cik_str")
+        if ticker and cik is not None:
+            result[ticker] = str(cik).zfill(10)
+    _TICKER_CIK_MAP = result
+    _log.info("Loaded SEC ticker->CIK map: %d entries", len(result))
+    return result
+
+
+def _cik_from_ticker(ticker: str) -> str | None:
+    """Map Wikipedia-style ``BRK.B`` to SEC's 10-digit CIK."""
+    mapping = _load_ticker_cik_map()
+    upper = ticker.upper()
+    for candidate in (upper, upper.replace(".", "-"), upper.replace(".", "")):
+        cik = mapping.get(candidate)
+        if cik:
+            return cik
+    return None
+
+
+def _edgar_company_facts(cik: str) -> dict[str, Any] | None:
+    """Fetch CompanyFacts JSON for one CIK. Returns None on any failure."""
+    url = f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
+    try:
+        resp = requests.get(
+            url,
+            timeout=15.0,
+            headers={"User-Agent": _EDGAR_UA, "Accept": "application/json"},
+        )
+    except (requests.ConnectionError, requests.Timeout) as exc:
+        _log.warning("EDGAR transport error for CIK %s: %s", cik, exc)
+        return None
+    if resp.status_code == 404:
+        _log.info("EDGAR has no CompanyFacts for CIK %s", cik)
+        return None
+    if not resp.ok:
+        _log.warning("EDGAR returned HTTP %d for CIK %s", resp.status_code, cik)
+        return None
+    try:
+        return resp.json()
+    except ValueError as exc:
+        _log.warning("EDGAR returned unparseable JSON for CIK %s: %s", cik, exc)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# yfinance-backed helpers
+# ---------------------------------------------------------------------------
+
+
+def _yf_ticker(symbol: str) -> Any:
+    """Return yfinance.Ticker with Wikipedia -> Yahoo symbol normalisation."""
+    return yf.Ticker(symbol.replace(".", "-"))
+
+
+def _current_price(symbol: str) -> float | None:
+    """Latest close price, or None on any yfinance failure."""
+    try:
+        hist = _yf_ticker(symbol).history(period="5d")
+    except Exception as exc:  # noqa: BLE001 — yfinance raises varied types
+        _log.warning("yfinance history failed for %s: %s", symbol, exc)
+        return None
+    if hist is None or len(hist) == 0 or "Close" not in hist.columns:
+        return None
+    return _parse_float(hist["Close"].iloc[-1])
+
+
+def _historical_closes(symbol: str):
+    """~6 years of daily closes as a pandas Series, or None."""
+    try:
+        hist = _yf_ticker(symbol).history(period="6y")
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("yfinance 6y history failed for %s: %s", symbol, exc)
+        return None
+    if hist is None or len(hist) == 0 or "Close" not in hist.columns:
+        return None
+    return hist["Close"]
+
+
+def _latest_headline(symbol: str) -> tuple[str | None, str | None]:
+    """Most recent (title, url) from yfinance, or (None, None).
+
+    yfinance's news payload shape drifts across releases. We accept
+    both the newer wrapped ``{"content": {...}}`` form and the older
+    flat ``{"title": ..., "link": ...}`` form.
+    """
+    try:
+        items = _yf_ticker(symbol).news or []
+    except Exception as exc:  # noqa: BLE001
+        _log.debug("yfinance news failed for %s: %s", symbol, exc)
+        return None, None
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        content = item.get("content")
+        if isinstance(content, dict):
+            title = content.get("title")
+            url = None
+            cu = content.get("canonicalUrl")
+            if isinstance(cu, dict):
+                url = cu.get("url")
+            if title:
+                return str(title), (str(url) if url else None)
+        title = item.get("title")
+        if title:
+            link = item.get("link") or item.get("url")
+            return str(title), (str(link) if link else None)
+    return None, None
+
+
+# ---------------------------------------------------------------------------
+# 5-year average P/E from annual EPS + historical closes
+# ---------------------------------------------------------------------------
+
+
+def _pe_5y_avg_from_eps_and_price(
+    annual_eps: dict[int, float],
+    historical_close: Any,
+) -> float | None:
+    """Mean of (close_at_fy_end / fy_eps) across 5 most recent fiscal years.
+
+    Skips years with EPS <= 0 (negative earnings produce nonsense P/Es).
+    Returns ``None`` if fewer than 3 valid data points resolve — a
+    2-point "average" is too easily distorted by one outlier year to
+    trust Layer 3 with.
+    """
+    if historical_close is None or len(historical_close) == 0:
+        return None
+    years = sorted(annual_eps.keys(), reverse=True)[:5]
+    if not years:
+        return None
+
+    pe_values: list[float] = []
+    for fy in years:
+        eps = annual_eps[fy]
+        if eps is None or eps <= 0:
+            continue
+        target = date(fy, 12, 31)
+        try:
+            idx_dates = historical_close.index.date
+        except AttributeError:
+            continue
+        try:
+            slice_ = historical_close[idx_dates <= target]
+        except Exception:  # noqa: BLE001
+            continue
+        if len(slice_) == 0:
+            continue
+        close = _parse_float(slice_.iloc[-1])
+        if close is None or close <= 0:
+            continue
+        pe_values.append(close / eps)
+
+    if len(pe_values) < 3:
+        return None
+    return mean(pe_values)
+
+
+# ---------------------------------------------------------------------------
+# FundamentalsClient — run-scoped counter + kill-switch + per-ticker fetch
+# ---------------------------------------------------------------------------
+
+
+class FundamentalsClient:
+    """EDGAR + yfinance adapter with the old FmpClient's public interface.
+
+    Exposes:
+
+    * :attr:`call_count` — monotonic tally of outbound HTTP attempts.
+    * :attr:`budget_exhausted` — becomes ``True`` when a persistent
+      failure makes further fetches pointless. In practice EDGAR's
+      rate limit (10 req/sec) is never reachable at our scale, so this
+      mostly stays ``False`` for the life of a run.
+
+    The ``api_key`` and ``cfg`` arguments are accepted for signature
+    compatibility with the old :class:`FmpClient` — the orchestrator
+    instantiates us as ``FmpClient(api_key=..., cfg=cfg.fmp)`` and we
+    preserve that call shape so nothing needs editing.
     """
 
-    def __init__(self, api_key: str, cfg: FmpConfig) -> None:
-        self._api_key = api_key
-        self._cfg = cfg
-        # Public, mutable-looking but read-only by convention. Exposed so
-        # the orchestrator can log the total at end-of-run and tests can
-        # assert against the budget bound.
+    def __init__(
+        self,
+        api_key: str | None = None,
+        cfg: FmpConfig | None = None,
+    ) -> None:
+        self._api_key = api_key  # unused; EDGAR needs no key
+        self._cfg = cfg or FmpConfig()
         self.call_count: int = 0
         self._budget_exhausted: bool = False
 
-    # ------------------------------------------------------------------
-    # Public read-only state
-    # ------------------------------------------------------------------
-
     @property
     def budget_exhausted(self) -> bool:
-        """``True`` once FMP has returned HTTP 429 for this run."""
         return self._budget_exhausted
 
-    # ------------------------------------------------------------------
-    # Public endpoint methods
-    # ------------------------------------------------------------------
+    def fetch(self, ticker: str) -> dict[str, Any]:
+        """Fetch every derived field for one ticker.
 
-    def get_ratios(self, ticker: str) -> list[dict[str, Any]]:
-        """GET ``/ratios/{ticker}`` — annual ratios, newest first.
-
-        Returns the raw list exactly as FMP delivered it. Empty list on
-        unknown tickers.
+        Returns a dict with keys ``pe_ratio``, ``pe_5y_avg``,
+        ``fcf_yield``, ``market_cap``, ``latest_headline``,
+        ``headline_url``. Any key may be ``None``; callers aggregate
+        into a :class:`Fundamentals` record.
         """
-        payload = self._request(f"ratios/{ticker}")
-        if isinstance(payload, list):
-            return payload
-        return []
+        result: dict[str, Any] = {
+            "pe_ratio": None,
+            "pe_5y_avg": None,
+            "fcf_yield": None,
+            "market_cap": None,
+            "latest_headline": None,
+            "headline_url": None,
+        }
 
-    def get_cash_flow_ttm(self, ticker: str) -> dict[str, Any] | None:
-        """GET ``/cash-flow-statement-ttm/{ticker}`` — single TTM row.
+        # CIK lookup (first call may populate the module cache)
+        self.call_count += 1
+        cik = _cik_from_ticker(ticker)
+        if cik is None:
+            _log.warning("No SEC CIK for ticker=%s; skipping", ticker)
+            return result
 
-        FMP returns a list with (at most) one element containing
-        ``freeCashFlow`` alongside the other TTM cash-flow line items. We
-        choose the TTM endpoint over ``/cash-flow-statement`` so we don't
-        have to reconstruct TTM from the most recent four quarters
-        ourselves; the caller only needs a single scalar FCF.
-        """
-        payload = self._request(f"cash-flow-statement-ttm/{ticker}")
-        if isinstance(payload, list) and payload:
-            first = payload[0]
-            if isinstance(first, dict):
-                return first
-        return None
+        # CompanyFacts
+        self.call_count += 1
+        facts = _edgar_company_facts(cik)
+        if facts is None:
+            return result
 
-    def get_profile(self, ticker: str) -> dict[str, Any] | None:
-        """GET ``/profile/{ticker}`` — single-row company profile.
+        # TTM EPS + annual EPS history
+        eps_entries = _facts_for_concept(facts, _CONCEPT_EPS_DILUTED)
+        ttm_eps = _ttm_eps(eps_entries)
+        annual_eps = _annual_eps_by_fy(eps_entries)
 
-        The caller reads ``mktCap`` off the returned dict to compute
-        ``fcf_yield``.
-        """
-        payload = self._request(f"profile/{ticker}")
-        if isinstance(payload, list) and payload:
-            first = payload[0]
-            if isinstance(first, dict):
-                return first
-        return None
+        # TTM free cash flow
+        ocf_entries = _facts_for_concept(facts, _CONCEPT_OPERATING_CASH_FLOW)
+        capex_entries = _facts_for_concept(facts, _CONCEPT_CAPEX)
+        ttm_ocf = _ttm_sum(ocf_entries)
+        ttm_capex = _ttm_sum(capex_entries)
+        ttm_fcf: float | None
+        if ttm_ocf is not None and ttm_capex is not None:
+            # CapEx is reported as a positive magnitude; subtract abs to
+            # get FCF.
+            ttm_fcf = ttm_ocf - abs(ttm_capex)
+        else:
+            ttm_fcf = None
 
-    def get_latest_press_release(self, ticker: str) -> dict[str, Any] | None:
-        """GET ``/press-releases/{ticker}?limit=1`` — most recent headline.
-
-        Returns a dict with at least ``title`` and optionally a URL under
-        one of several historical field names (``url``, ``link``). When no
-        explicit URL is present the caller may construct a fallback; this
-        method only forwards what FMP returned.
-        """
-        payload = self._request(
-            f"press-releases/{ticker}", extra_params={"limit": "1"}
+        # Shares outstanding
+        shares_entries = _facts_for_concept(facts, _CONCEPT_SHARES_OUTSTANDING)
+        shares_latest = _latest_quarterly(shares_entries, n=1)
+        shares_out = (
+            _parse_float(shares_latest[0].get("val")) if shares_latest else None
         )
-        if isinstance(payload, list) and payload:
-            first = payload[0]
-            if isinstance(first, dict):
-                return first
-        return None
 
-    # ------------------------------------------------------------------
-    # Internals — request dispatch with retry, counter, and kill-switch
-    # ------------------------------------------------------------------
+        # Current price (yfinance)
+        self.call_count += 1
+        current_price = _current_price(ticker)
 
-    def _request(
-        self,
-        path: str,
-        *,
-        extra_params: dict[str, str] | None = None,
-    ) -> Any:
-        """Dispatch one GET with retry, counter, and 429 kill-switch.
+        # Derivations
+        if (
+            shares_out is not None and shares_out > 0
+            and current_price is not None and current_price > 0
+        ):
+            result["market_cap"] = shares_out * current_price
 
-        The API key is passed as a query parameter rather than embedded
-        in the URL so that error messages and log records built from
-        ``response.url`` or the raw ``requests`` exception never echo
-        the key (Requirement 5.7, 9.8 spirit).
+        if (
+            ttm_eps is not None and ttm_eps > 0
+            and current_price is not None and current_price > 0
+        ):
+            result["pe_ratio"] = current_price / ttm_eps
 
-        Tenacity is applied inside the method so the ``call_count``
-        increment happens on every attempt, not only on the final
-        outcome — the counter measures real outbound calls, not logical
-        "get fundamentals for ticker X" operations.
-        """
-        # Kill-switch short-circuit: no network, no counter increment for
-        # the short-circuit. The counter reflects actual HTTP attempts.
-        if self._budget_exhausted:
-            raise FmpBudgetExhausted(
-                f"FMP budget exhausted for this run; skipping GET /{path}"
+        if (
+            ttm_fcf is not None
+            and result["market_cap"] is not None
+            and result["market_cap"] > 0
+        ):
+            result["fcf_yield"] = ttm_fcf / result["market_cap"]
+
+        # 5y average P/E (needs historical prices + annual EPS)
+        if annual_eps:
+            self.call_count += 1
+            historical = _historical_closes(ticker)
+            result["pe_5y_avg"] = _pe_5y_avg_from_eps_and_price(
+                annual_eps, historical
             )
 
-        url = f"{self._cfg.base_url.rstrip('/')}/{path}"
-        params: dict[str, str] = {"apikey": self._api_key}
-        if extra_params:
-            params.update(extra_params)
+        # Latest headline
+        self.call_count += 1
+        title, url = _latest_headline(ticker)
+        result["latest_headline"] = title
+        result["headline_url"] = url
 
-        # Wrap a single HTTP attempt so tenacity can retry transport
-        # errors and 5xx without us re-running the kill-switch gate.
-        def _one_attempt() -> Any:
-            self.call_count += 1
-            try:
-                response = requests.get(
-                    url,
-                    params=params,
-                    timeout=self._cfg.timeout_seconds,
-                )
-            except (requests.ConnectionError, requests.Timeout):
-                # Re-raise so tenacity can see the transport exception.
-                raise
+        return result
 
-            status = response.status_code
-            if status == 429:
-                # Kill-switch: set the flag BEFORE raising so any handler
-                # up the stack that calls another method sees the flipped
-                # state immediately.
-                self._budget_exhausted = True
-                _log.warning(
-                    "FMP returned HTTP 429; kill-switch engaged for the rest "
-                    "of this run (path=%s)",
-                    path,
-                )
-                raise FmpBudgetExhausted(
-                    f"FMP returned HTTP 429 for /{path}"
-                )
 
-            # Any other 4xx or 5xx raises HTTPError. Tenacity's predicate
-            # decides whether to retry (5xx only) or propagate (4xx).
-            response.raise_for_status()
-            return response.json()
-
-        # Build the retry wrapper lazily per call so tenacity's state is
-        # scoped to this request rather than the client instance.
-        wrapped: Callable[[], Any] = retry(
-            stop=stop_after_attempt(3),
-            wait=wait_exponential(multiplier=1, min=1, max=5),
-            retry=retry_if_exception(_retry_on_transient),
-            reraise=True,
-        )(_one_attempt)
-
-        return wrapped()
+# Legacy alias so ``from bot.fundamentals import FmpClient`` keeps working.
+FmpClient = FundamentalsClient
 
 
 # ---------------------------------------------------------------------------
-# Public entry point — cache-gated fundamentals fetch (Task 8.2)
+# Public entry point — cache-gated fundamentals fetch
 # ---------------------------------------------------------------------------
 
 
 def get_fundamentals(
     ticker: str,
     repo: Repository,
-    fmp_client: FmpClient,
+    fmp_client: FundamentalsClient,
     staleness_days: int,
 ) -> Fundamentals:
-    """Cache-gated fundamentals fetch for a single ticker.
+    """Cache-gated fundamentals fetch for one ticker.
 
-    Implements Requirements 3.1–3.5 plus the graceful-degradation
-    contract from Requirement 8.3:
+    1. If ``repo.load_fundamentals(ticker)`` has a row whose
+       ``fetched_at`` is within ``staleness_days`` of ``now``, return
+       it (Requirement 3.2).
+    2. Otherwise, if the client's budget is already exhausted, return
+       the stale cached row when available, else raise
+       :class:`FundamentalsBudgetExhausted`.
+    3. Otherwise, call :meth:`FundamentalsClient.fetch`, upsert, and
+       return the fresh :class:`Fundamentals`.
 
-    1. Call :meth:`Repository.load_fundamentals`. If a row exists and
-       ``now() - fetched_at < timedelta(days=staleness_days)``, return it
-       unchanged. FMP is not consulted (Requirements 3.1, 3.2).
-    2. On cache miss or stale row, and provided the client's 429
-       kill-switch has not already fired, call the four FMP endpoints,
-       derive ``pe_5y_avg`` and ``fcf_yield``, build a fresh
-       :class:`Fundamentals`, upsert it, and return it (Requirement 3.3).
-    3. If the kill-switch has fired (either before we entered the
-       function or during the FMP calls), fall back to the stale cached
-       row when one exists; otherwise re-raise :class:`FmpBudgetExhausted`
-       so the caller can skip this ticker (Requirement 8.3).
-
-    The caller (orchestrator / Filter_Pipeline) is responsible for
-    restricting invocation to L2_Survivors (Requirement 3.6).
+    The parameter name ``fmp_client`` is preserved from the old signature
+    so :mod:`bot.run` doesn't need editing; it now accepts a
+    :class:`FundamentalsClient`.
     """
     cached = repo.load_fundamentals(ticker)
     now = datetime.now(timezone.utc)
-    freshness_window = timedelta(days=staleness_days)
+    freshness = timedelta(days=staleness_days)
 
     if cached is not None:
-        # ``fetched_at`` is TIMESTAMPTZ coming back from psycopg; compare
-        # in UTC to avoid accidental naive-vs-aware TypeErrors. If the
-        # repository ever hands us a naive datetime we assume UTC.
         fetched_at = cached.fetched_at
         if fetched_at.tzinfo is None:
             fetched_at = fetched_at.replace(tzinfo=timezone.utc)
-        if now - fetched_at < freshness_window:
+        if now - fetched_at < freshness:
             return cached
 
-    # Cache missing or stale. If the kill-switch already fired we can't
-    # make any more FMP calls this run — serve the stale cached row
-    # (better than nothing) or give up on this ticker.
     if fmp_client.budget_exhausted:
         if cached is not None:
             _log.info(
-                "FMP budget exhausted; serving stale cache for %s "
-                "(fetched_at=%s)",
+                "Fundamentals budget exhausted; serving stale cache for %s",
                 ticker,
-                cached.fetched_at.isoformat(),
             )
             return cached
-        raise FmpBudgetExhausted(
-            f"No cached fundamentals for {ticker!r} and FMP budget "
-            f"exhausted for this run"
+        raise FundamentalsBudgetExhausted(
+            f"No cached fundamentals for {ticker!r} and budget exhausted"
         )
 
     try:
-        ratios = fmp_client.get_ratios(ticker)
-        cash_flow = fmp_client.get_cash_flow_ttm(ticker)
-        profile = fmp_client.get_profile(ticker)
-        press = fmp_client.get_latest_press_release(ticker)
-    except FmpBudgetExhausted:
-        # Budget tipped over mid-fetch. Degrade to stale cache if we have
-        # one; otherwise let the caller handle it.
+        fields = fmp_client.fetch(ticker)
+    except FundamentalsBudgetExhausted:
         if cached is not None:
             _log.info(
-                "FMP 429 during fetch for %s; falling back to stale cache "
-                "(fetched_at=%s)",
+                "Budget exhausted mid-fetch for %s; serving stale cache",
                 ticker,
-                cached.fetched_at.isoformat(),
             )
             return cached
         raise
 
-    # Derive the three numeric fields.
-    pe_ratio = (
-        _parse_float(
-            _first_not_none(ratios[0], ("priceEarningsRatio", "peRatio"))
-        )
-        if ratios
-        else None
-    )
-    pe_5y_avg = _pe_5y_avg(ratios)
-
-    ttm_fcf = (
-        _parse_float(cash_flow.get("freeCashFlow")) if cash_flow else None
-    )
-    market_cap = (
-        _parse_float(profile.get("mktCap")) if profile else None
-    )
-    if ttm_fcf is not None and market_cap is not None and market_cap > 0:
-        fcf_yield: float | None = ttm_fcf / market_cap
-    else:
-        # Requirement 3.4: NULL when market_cap is non-positive or missing.
-        fcf_yield = None
-
-    # Headline + optional URL. Respect whichever URL field FMP returned;
-    # we don't synthesise a URL here because a dead link is worse than no
-    # link in a Discord embed.
-    if press is not None:
-        latest_headline = press.get("title") or None
-        headline_url = _first_not_none(press, ("url", "link", "site")) or None
-    else:
-        latest_headline = None
-        headline_url = None
-
     fresh = Fundamentals(
         ticker=ticker,
-        pe_ratio=pe_ratio,
-        pe_5y_avg=pe_5y_avg,
-        fcf_yield=fcf_yield,
-        latest_headline=latest_headline,
-        headline_url=headline_url,
+        pe_ratio=fields.get("pe_ratio"),
+        pe_5y_avg=fields.get("pe_5y_avg"),
+        fcf_yield=fields.get("fcf_yield"),
+        latest_headline=fields.get("latest_headline"),
+        headline_url=fields.get("headline_url"),
         fetched_at=now,
     )
     repo.upsert_fundamentals(fresh)
