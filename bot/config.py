@@ -28,12 +28,15 @@ guarantees Requirement 6.4 / 11.12 (strict config validation).
 
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import yaml
 from pydantic import BaseModel, Field, ValidationInfo, field_validator
+
+_log = logging.getLogger(__name__)
 
 __all__ = [
     "Layer1Config",
@@ -41,6 +44,7 @@ __all__ = [
     "Layer3Config",
     "Layer4Config",
     "CacheConfig",
+    "UniverseSourceConfig",
     "UniverseConfig",
     "NotificationConfig",
     "FmpConfig",
@@ -113,12 +117,91 @@ class CacheConfig(BaseModel):
     fundamentals_staleness_days: int = Field(7, ge=1, le=90)
 
 
-class UniverseConfig(BaseModel):
-    """S&P 500 scrape source and sanity bounds."""
+class UniverseSourceConfig(BaseModel):
+    """One configured universe data source.
 
+    Each source has a unique ``name``, a ``kind`` that selects the parser,
+    a ``url`` to fetch, and optional per-source count bounds for sanity
+    checking.
+    """
+
+    name: str
+    kind: Literal["wikipedia_table", "etf_holdings_csv"]
+    url: str
+    enabled: bool = True
+    min_count: int = Field(0, ge=0)
+    max_count: int = Field(10000, ge=0)
+
+
+class UniverseConfig(BaseModel):
+    """Universe configuration with multi-source support.
+
+    Supports both the legacy single-source ``source_url`` field and the
+    new ``sources`` list. When ``sources`` is present, ``source_url`` is
+    ignored (Req 1.7). When ``sources`` is absent, a single Wikipedia
+    source is constructed from the legacy fields for backward
+    compatibility (Req 8.1).
+    """
+
+    # Legacy fields — preserved for backward compatibility
     min_constituent_count: int = Field(450, ge=0)
     max_constituent_count: int = Field(520, ge=0)
     source_url: str = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+
+    # New multi-source field
+    sources: list[UniverseSourceConfig] | None = None
+
+    # Composite bounds (applied after set-union)
+    min_composite_count: int = Field(450, ge=0)
+    max_composite_count: int = Field(3200, ge=0)
+
+    # Scan time monitoring
+    max_scan_minutes: int = Field(25, ge=1)
+
+    @field_validator("sources")
+    @classmethod
+    def _unique_source_names(
+        cls, v: list[UniverseSourceConfig] | None,
+    ) -> list[UniverseSourceConfig] | None:
+        """Reject duplicate source names (Req 1.3)."""
+        if v is None:
+            return v
+        names = [s.name for s in v]
+        if len(names) != len(set(names)):
+            raise ValueError("universe.sources names must be unique")
+        return v
+
+    def effective_sources(self) -> list[UniverseSourceConfig]:
+        """Return the resolved source list.
+
+        If ``sources`` is configured, return only the enabled entries
+        (ignoring ``source_url``). Otherwise, construct a single-source
+        fallback from the legacy fields so v1 configs produce identical
+        behavior (Req 8.1).
+
+        When both ``sources`` and ``source_url`` are specified, a WARN
+        is logged (Req 1.7).
+        """
+        if self.sources is not None:
+            # Req 1.7: warn if legacy source_url is also specified
+            default_url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+            if self.source_url != default_url:
+                _log.warning(
+                    "Both 'universe.sources' and 'universe.source_url' are "
+                    "specified; 'source_url' will be ignored in favour of "
+                    "'sources'"
+                )
+            return [s for s in self.sources if s.enabled]
+        return [
+            UniverseSourceConfig(
+                name="sp500_wikipedia",
+                kind="wikipedia_table",
+                url=self.source_url,
+                enabled=True,
+                min_count=self.min_constituent_count,
+                max_count=self.max_constituent_count,
+            )
+        ]
 
 
 class NotificationConfig(BaseModel):

@@ -218,6 +218,10 @@ def download_price_history(
     missing_after_batches: list[str] = []  # Wikipedia tickers
 
     # ---- Phase 1: one batch call per batch ---------------------------------
+    total = len(unique_wiki)
+    log_progress = total > 1000
+    completed = 0
+
     for batch in _batched(unique_wiki, cfg.batch_size):
         yahoo_batch = [wiki_to_yahoo[w] for w in batch]
         per_yahoo = _download_batch(yahoo_batch, cfg.history_period)
@@ -229,6 +233,15 @@ def download_price_history(
                 missing_after_batches.append(wiki_ticker)
             else:
                 result[wiki_ticker] = frame
+
+        completed += len(batch)
+        if log_progress:
+            logger.info(
+                "Price download progress: %d/%d tickers completed, %d remaining",
+                completed,
+                total,
+                total - completed,
+            )
 
     # ---- Phase 2: per-ticker retry for anything still missing --------------
     # yfinance doesn't expose a per-ticker retry knob, so we emulate it by

@@ -132,6 +132,7 @@ _COLOR_WATCHDOG = 0xF1C40F  # yellow — "something about the universe changed"
 # these ceilings, but a freakishly long headline or a 500-ticker diff
 # could).
 _DISCORD_FIELD_VALUE_LIMIT = 1024
+_DISCORD_EMBED_DESCRIPTION_LIMIT = 4096
 _HTTP_TIMEOUT_SECONDS = 10.0
 
 
@@ -247,31 +248,82 @@ def _build_high_conviction_embed(candidate: ScanCandidate) -> dict[str, Any]:
 
 
 def _build_watchdog_embed(diff: UniverseDiff) -> dict[str, Any]:
-    """Assemble the yellow rich embed for a non-empty :class:`UniverseDiff`.
+    """Assemble the yellow rich embed for a :class:`UniverseDiff`.
 
-    ``added`` / ``removed`` are comma-joined. When either is empty the
-    field shows an em-dash so Discord still renders a balanced two-column
-    layout. Both fields are truncated at Discord's 1024-char ceiling so
-    the embed never becomes malformed on a freakishly large diff.
+    Renders per-source attribution for added/removed tickers, a summary
+    line with composite size and source counts, and a Source Failures
+    section when any source failed. All field values are truncated to
+    Discord's 1024-char ceiling, and the total embed field content is
+    bounded to stay within the 4096-char embed description limit.
     """
-    added_text = ", ".join(diff.added) if diff.added else "\u2014"
-    removed_text = ", ".join(diff.removed) if diff.removed else "\u2014"
+    fields: list[dict[str, Any]] = []
+
+    # Summary line (Req 9.3)
+    summary_parts: list[str] = []
+    if diff.composite_size > 0:
+        summary_parts.append(f"Universe: {diff.composite_size} tickers")
+    if diff.sources_enabled > 0:
+        summary_parts.append(
+            f"Sources: {diff.sources_succeeded}/{diff.sources_enabled} succeeded"
+        )
+    if summary_parts:
+        fields.append({
+            "name": "Summary",
+            "value": " | ".join(summary_parts),
+            "inline": False,
+        })
+
+    # Per-source added tickers (Req 9.1)
+    if diff.added:
+        # Group by primary source (first entry in source_attribution)
+        by_source: dict[str, list[str]] = {}
+        for ticker in diff.added:
+            sources = diff.source_attribution.get(ticker, [])
+            primary = sources[0] if sources else "unknown"
+            by_source.setdefault(primary, []).append(ticker)
+        for source_name, tickers in by_source.items():
+            text = ", ".join(tickers)
+            fields.append({
+                "name": f"Added ({source_name})",
+                "value": _truncate(text),
+                "inline": True,
+            })
+
+    # Removed tickers
+    if diff.removed:
+        text = ", ".join(diff.removed)
+        fields.append({
+            "name": "Removed",
+            "value": _truncate(text),
+            "inline": True,
+        })
+
+    # Source failures (Req 9.2)
+    if diff.source_failures:
+        failure_lines = [
+            f"**{name}**: {reason}"
+            for name, reason in diff.source_failures
+        ]
+        text = "\n".join(failure_lines)
+        fields.append({
+            "name": "\u26A0\uFE0F Source Failures",
+            "value": _truncate(text),
+            "inline": False,
+        })
+
+    # Truncate fields to stay within Discord's total embed limits.
+    # Each field value is already capped at 1024 chars by _truncate().
+    # As a safety net, if total field content exceeds the embed
+    # description limit, trim the last fields.
+    total_chars = sum(len(f["value"]) + len(f["name"]) for f in fields)
+    while total_chars > _DISCORD_EMBED_DESCRIPTION_LIMIT and len(fields) > 1:
+        fields.pop(-2)  # drop a middle field, keep summary + failures
+        total_chars = sum(len(f["value"]) + len(f["name"]) for f in fields)
 
     return {
-        "title": "\u26A0\uFE0F S&P 500 Universe Changed",
+        "title": "\u26A0\uFE0F Universe Sync Report",
         "color": _COLOR_WATCHDOG,
-        "fields": [
-            {
-                "name": "Added",
-                "value": _truncate(added_text),
-                "inline": True,
-            },
-            {
-                "name": "Removed",
-                "value": _truncate(removed_text),
-                "inline": True,
-            },
-        ],
+        "fields": fields,
         "footer": {"text": "Local asset_universe has been synced."},
         "timestamp": _utc_now_iso(),
     }
@@ -451,14 +503,13 @@ def send_watchdog(
     webhook_url: str,
     cfg: NotificationConfig,
 ) -> None:
-    """Post a watchdog rich embed for a non-empty :class:`UniverseDiff`.
+    """Post a watchdog rich embed for a :class:`UniverseDiff`.
 
-    Implements Requirements 5.2, 5.3, 5.6, 5.7.
+    Implements Requirements 5.2, 5.3, 5.6, 5.7, 9.4.
 
-    The caller is responsible for deciding whether the diff is non-empty;
-    this function will happily render ``Added: \u2014 / Removed: \u2014``
-    if asked to. In normal orchestrator flow the caller guards with
-    ``if diff.added or diff.removed:``.
+    The caller should invoke this when the diff is non-empty (added or
+    removed tickers) OR when source failures exist. This function will
+    render whatever is present in the diff.
 
     Args:
         diff: The :class:`UniverseDiff` to announce.
@@ -475,9 +526,11 @@ def send_watchdog(
     }
 
     logger.info(
-        "Posting watchdog alert to Discord webhook (added=%d, removed=%d)",
+        "Posting watchdog alert to Discord webhook "
+        "(added=%d, removed=%d, source_failures=%d)",
         len(diff.added),
         len(diff.removed),
+        len(diff.source_failures),
     )
     _post_with_retry(webhook_url, payload, cfg)
     logger.info("Watchdog alert delivered")

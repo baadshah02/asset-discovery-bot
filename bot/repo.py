@@ -55,9 +55,10 @@ from sqlalchemy import (
     and_,
     func,
     select,
+    text,
     update,
 )
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.exc import IntegrityError
@@ -128,6 +129,12 @@ asset_universe = Table(
         DateTime(timezone=True),
         nullable=False,
         server_default=func.now(),
+    ),
+    Column(
+        "index_sources",
+        ARRAY(String),
+        nullable=False,
+        server_default=text("'{}'::TEXT[]"),
     ),
 )
 
@@ -281,6 +288,7 @@ class Repository:
         self,
         entries: list[tuple[str, str, str | None]],
         as_of: date,
+        source_attribution: dict[str, list[str]] | None = None,
     ) -> None:
         """Upsert the scraped universe and mark absent tickers as removed.
 
@@ -289,13 +297,20 @@ class Repository:
         to be NOT NULL, so the universe scraper must supply it alongside the
         ticker; ``sector`` may be ``None``.
 
+        ``source_attribution``, when provided, is a mapping from ticker to
+        the list of source names that contributed that ticker in the current
+        Scan_Run. Each ticker's ``index_sources`` column is set to the
+        sorted source list. When ``None`` (v1 backward compatibility),
+        ``index_sources`` is not modified during the upsert.
+
         Behaviour, executed in a single transaction so the diff and the
         removal marker stay consistent:
 
         1. ``INSERT ... ON CONFLICT (ticker) DO UPDATE`` every input row,
            refreshing ``company_name``, ``sector``, ``last_seen_at`` and
            clearing ``removed_on`` if the ticker had previously been marked
-           as removed (handles readmissions).
+           as removed (handles readmissions). When ``source_attribution``
+           is provided, ``index_sources`` is also set.
         2. ``UPDATE asset_universe SET removed_on = :as_of`` for every
            currently-active ticker not present in the scrape.
 
@@ -304,7 +319,7 @@ class Repository:
         :mod:`bot.universe` is responsible for aborting that case before
         reaching the repository.
 
-        Requirements: 7.1, 7.2, 7.6, 1.4.
+        Requirements: 7.1, 7.2, 7.6, 1.4, 4.2, 3.7, 8.2.
         """
         scraped_tickers = {ticker for ticker, _, _ in entries}
 
@@ -315,18 +330,32 @@ class Repository:
                         "ticker": ticker,
                         "company_name": company_name,
                         "sector": sector,
+                        **(
+                            {
+                                "index_sources": sorted(
+                                    source_attribution.get(ticker, [])
+                                )
+                            }
+                            if source_attribution is not None
+                            else {}
+                        ),
                     }
                     for ticker, company_name, sector in entries
                 ]
                 insert_stmt = pg_insert(asset_universe).values(payload)
+                upsert_set: dict[str, Any] = {
+                    "company_name": insert_stmt.excluded.company_name,
+                    "sector": insert_stmt.excluded.sector,
+                    "removed_on": None,
+                    "last_seen_at": func.now(),
+                }
+                if source_attribution is not None:
+                    upsert_set["index_sources"] = (
+                        insert_stmt.excluded.index_sources
+                    )
                 upsert_stmt = insert_stmt.on_conflict_do_update(
                     index_elements=[asset_universe.c.ticker],
-                    set_={
-                        "company_name": insert_stmt.excluded.company_name,
-                        "sector": insert_stmt.excluded.sector,
-                        "removed_on": None,
-                        "last_seen_at": func.now(),
-                    },
+                    set_=upsert_set,
                 )
                 conn.execute(upsert_stmt)
 

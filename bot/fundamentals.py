@@ -24,6 +24,8 @@ from __future__ import annotations
 
 import logging
 import math
+import threading
+import time
 from datetime import date, datetime, timedelta, timezone
 from statistics import mean
 from typing import Any, Iterable
@@ -35,6 +37,7 @@ from bot.config import FmpConfig
 from bot.repo import Fundamentals, Repository  # noqa: F401
 
 __all__ = [
+    "EdgarRateLimiter",
     "Fundamentals",
     "FundamentalsBudgetExhausted",
     "FundamentalsClient",
@@ -48,6 +51,43 @@ _log = logging.getLogger(__name__)
 # The SEC asks every CompanyFacts consumer to identify themselves in the
 # User-Agent. Requests without a recognisable UA return 403.
 _EDGAR_UA = "asset-discovery-bot bot@asset-discovery-bot.local"
+
+
+class EdgarRateLimiter:
+    """Token-bucket rate limiter for EDGAR API calls (10 req/sec).
+
+    Uses a simple interval-based approach: each :meth:`acquire` call
+    blocks until at least ``1 / max_per_second`` seconds have elapsed
+    since the previous call. Thread-safe via :class:`threading.Lock`.
+
+    The :attr:`consecutive_waits` counter tracks how many back-to-back
+    calls had to sleep, which the caller uses to detect sustained
+    throttling (Req 7.6).
+    """
+
+    def __init__(self, max_per_second: float = 10.0) -> None:
+        self._interval = 1.0 / max_per_second
+        self._last_call: float = 0.0
+        self._lock = threading.Lock()
+        self._consecutive_waits: int = 0
+
+    def acquire(self) -> None:
+        """Block until a request slot is available."""
+        with self._lock:
+            now = time.monotonic()
+            elapsed = now - self._last_call
+            if elapsed < self._interval:
+                wait = self._interval - elapsed
+                time.sleep(wait)
+                self._consecutive_waits += 1
+            else:
+                self._consecutive_waits = 0
+            self._last_call = time.monotonic()
+
+    @property
+    def consecutive_waits(self) -> int:
+        """Number of consecutive :meth:`acquire` calls that had to sleep."""
+        return self._consecutive_waits
 
 
 class FundamentalsBudgetExhausted(Exception):
@@ -258,73 +298,6 @@ def _annual_eps_by_fy(eps_entries: list[dict[str, Any]]) -> dict[int, float]:
 
 
 # ---------------------------------------------------------------------------
-# SEC EDGAR — ticker -> CIK lookup (process cache) and CompanyFacts fetch
-# ---------------------------------------------------------------------------
-
-
-_TICKER_CIK_MAP: dict[str, str] | None = None
-
-
-def _load_ticker_cik_map() -> dict[str, str]:
-    """Fetch the SEC ticker -> CIK table once per process."""
-    global _TICKER_CIK_MAP
-    if _TICKER_CIK_MAP is not None:
-        return _TICKER_CIK_MAP
-    resp = requests.get(
-        "https://www.sec.gov/files/company_tickers.json",
-        timeout=10.0,
-        headers={"User-Agent": _EDGAR_UA},
-    )
-    resp.raise_for_status()
-    raw = resp.json()
-    result: dict[str, str] = {}
-    for entry in raw.values():
-        ticker = str(entry.get("ticker", "")).upper()
-        cik = entry.get("cik_str")
-        if ticker and cik is not None:
-            result[ticker] = str(cik).zfill(10)
-    _TICKER_CIK_MAP = result
-    _log.info("Loaded SEC ticker->CIK map: %d entries", len(result))
-    return result
-
-
-def _cik_from_ticker(ticker: str) -> str | None:
-    """Map Wikipedia-style ``BRK.B`` to SEC's 10-digit CIK."""
-    mapping = _load_ticker_cik_map()
-    upper = ticker.upper()
-    for candidate in (upper, upper.replace(".", "-"), upper.replace(".", "")):
-        cik = mapping.get(candidate)
-        if cik:
-            return cik
-    return None
-
-
-def _edgar_company_facts(cik: str) -> dict[str, Any] | None:
-    """Fetch CompanyFacts JSON for one CIK. Returns None on any failure."""
-    url = f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
-    try:
-        resp = requests.get(
-            url,
-            timeout=15.0,
-            headers={"User-Agent": _EDGAR_UA, "Accept": "application/json"},
-        )
-    except (requests.ConnectionError, requests.Timeout) as exc:
-        _log.warning("EDGAR transport error for CIK %s: %s", cik, exc)
-        return None
-    if resp.status_code == 404:
-        _log.info("EDGAR has no CompanyFacts for CIK %s", cik)
-        return None
-    if not resp.ok:
-        _log.warning("EDGAR returned HTTP %d for CIK %s", resp.status_code, cik)
-        return None
-    try:
-        return resp.json()
-    except ValueError as exc:
-        _log.warning("EDGAR returned unparseable JSON for CIK %s: %s", cik, exc)
-        return None
-
-
-# ---------------------------------------------------------------------------
 # yfinance-backed helpers
 # ---------------------------------------------------------------------------
 
@@ -468,10 +441,33 @@ class FundamentalsClient:
         self._cfg = cfg or FmpConfig()
         self.call_count: int = 0
         self._budget_exhausted: bool = False
+        self._rate_limiter = EdgarRateLimiter(max_per_second=10.0)
+        self._consecutive_wait_start: float | None = None
 
     @property
     def budget_exhausted(self) -> bool:
         return self._budget_exhausted
+
+    def _acquire_edgar_slot(self) -> None:
+        """Acquire a rate-limiter slot before an EDGAR HTTP call.
+
+        Logs a WARN if the rate limiter has been engaged for more than
+        30 consecutive seconds (Req 7.6).
+        """
+        self._rate_limiter.acquire()
+        if self._rate_limiter.consecutive_waits > 0:
+            if self._consecutive_wait_start is None:
+                self._consecutive_wait_start = time.monotonic()
+            elapsed = time.monotonic() - self._consecutive_wait_start
+            if elapsed > 30.0:
+                _log.warning(
+                    "EDGAR rate limiter engaged for %.1fs consecutive; "
+                    "consider increasing cache.fundamentals_staleness_days "
+                    "or reducing universe size",
+                    elapsed,
+                )
+        else:
+            self._consecutive_wait_start = None
 
     def fetch(self, ticker: str) -> dict[str, Any]:
         """Fetch every derived field for one ticker.
@@ -492,6 +488,7 @@ class FundamentalsClient:
 
         # CIK lookup (first call may populate the module cache)
         self.call_count += 1
+        self._acquire_edgar_slot()
         cik = _cik_from_ticker(ticker)
         if cik is None:
             _log.warning("No SEC CIK for ticker=%s; skipping", ticker)
@@ -499,6 +496,7 @@ class FundamentalsClient:
 
         # CompanyFacts
         self.call_count += 1
+        self._acquire_edgar_slot()
         facts = _edgar_company_facts(cik)
         if facts is None:
             return result

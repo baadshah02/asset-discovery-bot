@@ -65,6 +65,7 @@ phase markers and error context during v1 bring-up.
 from __future__ import annotations
 
 import logging
+import time
 from datetime import date
 
 import pandas as pd
@@ -116,6 +117,24 @@ EXIT_NOTIFY_ERROR: int = 5
 
 
 logger = logging.getLogger(__name__)
+
+
+def _check_scan_time(
+    scan_start: float,
+    max_scan_minutes: int,
+    phase: str,
+) -> None:
+    """Log WARN if elapsed scan time exceeds the configured threshold."""
+    elapsed_seconds = time.monotonic() - scan_start
+    elapsed_minutes = elapsed_seconds / 60.0
+    if elapsed_minutes > max_scan_minutes:
+        logger.warning(
+            "Scan time %.1f min exceeds max_scan_minutes=%d; "
+            "active phase: %s",
+            elapsed_minutes,
+            max_scan_minutes,
+            phase,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -176,6 +195,7 @@ def main() -> int:
     # ``future=True`` is the SQLAlchemy 2.0 idiom; it is the default for
     # SA 2.0.x but we set it explicitly so the behaviour is documented at
     # the orchestrator boundary.
+    scan_start = time.monotonic()
     engine = create_engine(secrets.db_url, future=True)
     repo = Repository(engine)
 
@@ -200,11 +220,12 @@ def main() -> int:
             )
             return EXIT_DB_ERROR
 
-        # Watchdog alert on any non-empty diff (Requirement 1.3). Treat
-        # delivery failure as non-fatal: missing a watchdog alert is less
-        # bad than missing a high-conviction alert later in the same run,
-        # so we log ERROR and keep going.
-        if diff.added or diff.removed:
+        # Watchdog alert on any non-empty diff or source failures
+        # (Requirement 1.3, 9.4). Treat delivery failure as non-fatal:
+        # missing a watchdog alert is less bad than missing a
+        # high-conviction alert later in the same run, so we log ERROR
+        # and keep going.
+        if diff.added or diff.removed or diff.source_failures:
             try:
                 send_watchdog(
                     diff,
@@ -222,6 +243,8 @@ def main() -> int:
                 "Database unreachable while loading universe: %s", exc
             )
             return EXIT_DB_ERROR
+
+        _check_scan_time(scan_start, cfg.universe.max_scan_minutes, "universe_sync")
 
         if not universe:
             logger.error(
@@ -246,12 +269,15 @@ def main() -> int:
             len(after_l2),
         )
 
+        _check_scan_time(scan_start, cfg.universe.max_scan_minutes, "price_download")
+
         # ---- Phase 6: FMP enrichment (L2 survivors only) ------------------
         # Fundamentals are fetched ONLY for L2 survivors (Requirements 3.6,
         # 4.3). The :class:`FmpClient` is instantiated per run so the
         # kill-switch flag and call counter reset naturally.
         fmp_client = FmpClient(api_key=secrets.fmp_api_key, cfg=cfg.fmp)
         enriched_rows: list[dict[str, object]] = []
+        graceful_degradation_count = 0
 
         for row in after_l2.to_dict(orient="records"):
             ticker = row["ticker"]
@@ -277,6 +303,16 @@ def main() -> int:
                 )
                 return EXIT_DB_ERROR
 
+            # Graceful degradation: exclude tickers with missing
+            # fundamentals from L3/L4 (Req 6.4).
+            if (
+                f.pe_ratio is None
+                or f.pe_5y_avg is None
+                or f.fcf_yield is None
+            ):
+                graceful_degradation_count += 1
+                continue
+
             enriched_rows.append(
                 {
                     **row,
@@ -287,6 +323,15 @@ def main() -> int:
                     "headline_url": f.headline_url,
                 }
             )
+
+        logger.info(
+            "Graceful degradation: %d/%d L2 survivors excluded "
+            "(missing fundamentals)",
+            graceful_degradation_count,
+            len(after_l2),
+        )
+
+        _check_scan_time(scan_start, cfg.universe.max_scan_minutes, "enrichment")
 
         # ---- Phase 7: L3 + L4 ---------------------------------------------
         if not enriched_rows:
@@ -307,6 +352,8 @@ def main() -> int:
             len(after_l4),
         )
         logger.info("FMP calls this run: %d", fmp_client.call_count)
+
+        _check_scan_time(scan_start, cfg.universe.max_scan_minutes, "filtering")
 
         # ---- Phase 8: alert + persist -------------------------------------
         # ``mode="json"`` coerces ``Path`` (and any other non-primitive

@@ -55,6 +55,43 @@ universe:
   max_constituent_count: 520
   source_url: "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
 
+  # Composite bounds (applied after set-union deduplication across all
+  # enabled sources). Relevant when `sources` is configured.
+  min_composite_count: 450
+  max_composite_count: 3200
+
+  # Scan time monitoring: log WARN if total elapsed time exceeds this
+  # threshold (minutes). The scan is NOT aborted — this is a monitoring
+  # signal for the operator to tune batch sizes or reduce the universe.
+  max_scan_minutes: 25
+
+  # Multi-source configuration (optional). When present, `source_url`
+  # above is ignored. Each source has a unique name, a kind that selects
+  # the parser, a URL to fetch, and optional per-source count bounds.
+  # Uncomment and edit to enable multi-source universe expansion.
+  #
+  # sources:
+  #   - name: "sp500_wikipedia"
+  #     kind: "wikipedia_table"
+  #     url: "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+  #     enabled: true
+  #     min_count: 450
+  #     max_count: 520
+  #
+  #   - name: "russell1000_iwb"
+  #     kind: "etf_holdings_csv"
+  #     url: "https://www.ishares.com/us/products/239707/ishares-russell-1000-etf/1467271812596.ajax?fileType=csv&fileName=IWB_holdings&dataType=fund"
+  #     enabled: true
+  #     min_count: 900
+  #     max_count: 1100
+  #
+  #   - name: "russell2000_iwm"
+  #     kind: "etf_holdings_csv"
+  #     url: "https://www.ishares.com/us/products/239710/ishares-russell-2000-etf/1467271812596.ajax?fileType=csv&fileName=IWM_holdings&dataType=fund"
+  #     enabled: false   # Phase 2 — enable when ready
+  #     min_count: 1800
+  #     max_count: 2200
+
 notification:
   # Discord webhook retry budget for 429 / 5xx responses.
   max_retries: 5
