@@ -93,6 +93,7 @@ services:
       - db_password
       - db_url
       - discord_webhook_url
+      - discord_composite_webhook_url
     networks:
       - internal
     # Req 9.6: no `ports:` key — the bot makes only outbound HTTPS calls.
@@ -112,6 +113,8 @@ secrets:
     file: ./secrets/db_url.txt
   discord_webhook_url:
     file: ./secrets/discord_webhook_url.txt
+  discord_composite_webhook_url:
+    file: ./secrets/discord_composite_webhook_url.txt
 
 volumes:
   pgdata:

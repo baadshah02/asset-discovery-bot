@@ -167,6 +167,25 @@ fundamentals_cache = Table(
         nullable=False,
         server_default=func.now(),
     ),
+    # v2 extended fields for composite scoring (migration 003)
+    Column("total_debt", Numeric(16, 2), nullable=True),
+    Column("cash_and_equivalents", Numeric(16, 2), nullable=True),
+    Column("ebit", Numeric(16, 2), nullable=True),
+    Column("revenue_ttm", Numeric(16, 2), nullable=True),
+    Column("book_value_of_equity", Numeric(16, 2), nullable=True),
+    Column("dividends_paid_ttm", Numeric(16, 2), nullable=True),
+    Column("share_buybacks_ttm", Numeric(16, 2), nullable=True),
+    Column("cogs_ttm", Numeric(16, 2), nullable=True),
+    Column("total_assets", Numeric(16, 2), nullable=True),
+    Column("annual_eps_5y", ARRAY(Numeric(12, 4)), nullable=True),
+    Column("net_income_ttm", Numeric(16, 2), nullable=True),
+    Column("operating_cash_flow_ttm", Numeric(16, 2), nullable=True),
+    Column(
+        "fundamentals_schema_version",
+        BigInteger,
+        nullable=False,
+        server_default=text("1"),
+    ),
 )
 
 Index("ix_fundamentals_cache_fetched", fundamentals_cache.c.fetched_at)
@@ -197,6 +216,14 @@ daily_scans = Table(
         nullable=False,
         server_default=func.now(),
     ),
+    # v2 composite scoring columns (migration 003)
+    Column("value_composite", Numeric(10, 6), nullable=True),
+    Column("quality_composite", Numeric(10, 6), nullable=True),
+    Column("reversal_signal", Numeric(10, 6), nullable=True),
+    Column("composite_score", Numeric(10, 6), nullable=True),
+    Column("composite_rank", BigInteger, nullable=True),
+    Column("sector_at_rank", String(64), nullable=True),
+    Column("pipeline_mode", String(32), nullable=True),
     UniqueConstraint("ticker", "scan_date", name="uq_scan_per_day"),
 )
 
@@ -220,6 +247,17 @@ _SCAN_FIELDS: tuple[str, ...] = (
     "pe_5y_avg",
     "fcf_yield",
     "latest_headline",
+)
+
+# Additional fields for composite-rank pipeline rows.
+_COMPOSITE_SCAN_FIELDS: tuple[str, ...] = (
+    "value_composite",
+    "quality_composite",
+    "reversal_signal",
+    "composite_score",
+    "composite_rank",
+    "sector_at_rank",
+    "pipeline_mode",
 )
 
 
@@ -444,6 +482,83 @@ class Repository:
         with self.transaction() as conn:
             conn.execute(upsert_stmt)
 
+    def load_extended_fundamentals(self, ticker: str) -> dict[str, Any] | None:
+        """Return the full Extended_Fundamentals record from cache, or None.
+
+        Returns a dict with all v1 + v2 fields including
+        ``fundamentals_schema_version``. Used by the composite-rank
+        pipeline to gate EDGAR refetches (Requirement 8.6).
+        """
+        stmt = select(fundamentals_cache).where(
+            fundamentals_cache.c.ticker == ticker
+        )
+        with self.transaction() as conn:
+            row = conn.execute(stmt).one_or_none()
+
+        if row is None:
+            return None
+
+        mapping = dict(row._mapping)
+        # Convert Decimal types to float for downstream consumption
+        for key, val in mapping.items():
+            if val is not None and hasattr(val, "is_finite"):
+                mapping[key] = float(val)
+        # Convert annual_eps_5y array elements to float
+        if mapping.get("annual_eps_5y") is not None:
+            mapping["annual_eps_5y"] = [
+                float(v) if v is not None else None
+                for v in mapping["annual_eps_5y"]
+            ]
+        return mapping
+
+    def upsert_extended_fundamentals(
+        self,
+        ticker: str,
+        fields: dict[str, Any],
+    ) -> None:
+        """Upsert a full Extended_Fundamentals record with schema_version.
+
+        ``fields`` should contain all v1 + v2 column values. The
+        ``fundamentals_schema_version`` field must be included.
+        On conflict the existing row is fully overwritten (Requirement 8.6).
+        """
+        values = {"ticker": ticker}
+        # Map all fundamentals_cache columns (except ticker PK)
+        column_names = {
+            c.name for c in fundamentals_cache.columns if c.name != "ticker"
+        }
+        for col_name in column_names:
+            if col_name in fields:
+                values[col_name] = fields[col_name]
+
+        insert_stmt = pg_insert(fundamentals_cache).values(**values)
+        update_set = {
+            k: insert_stmt.excluded[k]
+            for k in values
+            if k != "ticker"
+        }
+        upsert_stmt = insert_stmt.on_conflict_do_update(
+            index_elements=[fundamentals_cache.c.ticker],
+            set_=update_set,
+        )
+        with self.transaction() as conn:
+            conn.execute(upsert_stmt)
+
+    def load_sectors(self, tickers: list[str]) -> dict[str, str | None]:
+        """Load sector assignments for a list of tickers from asset_universe.
+
+        Returns a dict mapping ticker -> sector (may be None).
+        """
+        if not tickers:
+            return {}
+        stmt = select(
+            asset_universe.c.ticker,
+            asset_universe.c.sector,
+        ).where(asset_universe.c.ticker.in_(tickers))
+        with self.transaction() as conn:
+            rows = conn.execute(stmt).all()
+        return {row.ticker: row.sector for row in rows}
+
     # ------------------------------------------------------------------
     # daily_scans
     # ------------------------------------------------------------------
@@ -469,10 +584,22 @@ class Repository:
         :class:`DuplicateScanError`, which the orchestrator catches as a
         no-op (Requirement 7.4). Any other ``IntegrityError`` is re-raised
         unchanged.
+
+        Composite-rank pipeline rows include additional fields
+        (value_composite, quality_composite, reversal_signal,
+        composite_score, composite_rank, sector_at_rank, pipeline_mode).
+        These are extracted when present and left null otherwise, preserving
+        backward compatibility with v1 callers (Requirement 8.7).
         """
         values = {field: _extract(candidate, field) for field in _SCAN_FIELDS}
         values["scan_date"] = scan_date
         values["config_snapshot"] = config_snapshot
+
+        # Extract composite columns when present (v2 pipeline)
+        for field in _COMPOSITE_SCAN_FIELDS:
+            val = _extract(candidate, field)
+            if val is not None:
+                values[field] = val
 
         stmt = pg_insert(daily_scans).values(**values)
         try:

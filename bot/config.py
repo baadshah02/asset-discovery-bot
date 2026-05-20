@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import logging
 import os
+from enum import Enum
 from pathlib import Path
 from typing import Any, Literal
 
@@ -50,6 +51,11 @@ __all__ = [
     "FmpConfig",
     "YFinanceConfig",
     "LoggingConfig",
+    "PipelineMode",
+    "PipelineConfig",
+    "ScoringConfig",
+    "RankingConfig",
+    "ReversalConfig",
     "AppConfig",
     "Secrets",
     "load_config",
@@ -239,6 +245,60 @@ class LoggingConfig(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Composite-rank pipeline configuration (v2)
+# ---------------------------------------------------------------------------
+
+
+class PipelineMode(str, Enum):
+    """Selects between v1 hard-threshold and v2 composite-rank pipelines."""
+
+    HARD_THRESHOLD = "hard_threshold"
+    COMPOSITE_RANK = "composite_rank"
+
+
+class PipelineConfig(BaseModel):
+    """Top-level pipeline selection."""
+
+    mode: PipelineMode = PipelineMode.HARD_THRESHOLD
+
+
+class ScoringConfig(BaseModel):
+    """Composite scoring weights. All weights in [0.0, 10.0]."""
+
+    value_weight: float = Field(1.0, ge=0.0, le=10.0)
+    quality_weight: float = Field(1.0, ge=0.0, le=10.0)
+    reversal_weight: float = Field(0.5, ge=0.0, le=10.0)
+
+    @field_validator("reversal_weight")
+    @classmethod
+    def _not_all_zero(cls, v: float, info: ValidationInfo) -> float:
+        """Reject degenerate config where all weights are zero."""
+        vw = info.data.get("value_weight", 1.0)
+        qw = info.data.get("quality_weight", 1.0)
+        if vw == 0.0 and qw == 0.0 and v == 0.0:
+            raise ValueError(
+                "At least one scoring weight must be non-zero"
+            )
+        return v
+
+
+class RankingConfig(BaseModel):
+    """Ranking and top-N selection parameters."""
+
+    sector_neutral: bool = True
+    top_n: int = Field(20, ge=1, le=500)
+    top_n_per_sector: int = Field(2, ge=1, le=50)
+    min_sector_size: int = Field(5, ge=1, le=50)
+
+
+class ReversalConfig(BaseModel):
+    """Short-term reversal signal parameters."""
+
+    enabled: bool = True
+    lookback_days: int = Field(21, ge=5, le=252)
+
+
+# ---------------------------------------------------------------------------
 # Root application config (immutable after load)
 # ---------------------------------------------------------------------------
 
@@ -258,6 +318,12 @@ class AppConfig(BaseModel):
     fmp: FmpConfig = Field(default_factory=FmpConfig)
     yfinance: YFinanceConfig = Field(default_factory=YFinanceConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
+
+    # v2 composite-rank pipeline sections
+    pipeline: PipelineConfig = Field(default_factory=PipelineConfig)
+    scoring: ScoringConfig = Field(default_factory=ScoringConfig)
+    ranking: RankingConfig = Field(default_factory=RankingConfig)
+    reversal: ReversalConfig = Field(default_factory=ReversalConfig)
 
     def diff_from_defaults(self) -> dict[str, dict[str, Any]]:
         """Return non-default leaf values for the startup log line (Req 6.6).
@@ -303,6 +369,10 @@ class Secrets(BaseModel):
     fundamentals adapter no longer needs an FMP key. The field remains
     so existing secret files keep working; a missing or empty
     ``fmp_api_key`` file no longer aborts startup.
+
+    ``discord_composite_webhook_url`` is optional — when non-empty,
+    composite-rank pipeline alerts are sent to this separate webhook
+    instead of the primary ``discord_webhook_url``.
     """
 
     model_config = {"frozen": True}
@@ -310,6 +380,7 @@ class Secrets(BaseModel):
     db_url: str
     fmp_api_key: str = ""  # optional; unused by the EDGAR adapter
     discord_webhook_url: str
+    discord_composite_webhook_url: str = ""  # optional; composite pipeline
 
     def __repr__(self) -> str:
         # Never interpolate field values — only field names.
@@ -325,6 +396,7 @@ _SECRET_FILENAMES: dict[str, str] = {
     "db_url": "db_url",
     "fmp_api_key": "fmp_api_key",
     "discord_webhook_url": "discord_webhook_url",
+    "discord_composite_webhook_url": "discord_composite_webhook_url",
 }
 
 
@@ -445,7 +517,9 @@ def load_config(
     # ``fmp_api_key`` is no longer strictly required (EDGAR migration);
     # read it if present so existing deployments keep working but don't
     # abort when the file is missing.
-    _OPTIONAL_SECRETS = {"fmp_api_key"}
+    # ``discord_composite_webhook_url`` is optional — only needed when
+    # composite-rank alerts should go to a separate channel.
+    _OPTIONAL_SECRETS = {"fmp_api_key", "discord_composite_webhook_url"}
     secret_values: dict[str, str] = {
         field_name: _read_secret(
             secrets_dir,

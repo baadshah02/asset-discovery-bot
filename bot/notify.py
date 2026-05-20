@@ -75,6 +75,7 @@ from bot.universe import UniverseDiff
 __all__ = [
     "NotificationError",
     "send_high_conviction",
+    "send_ranked_candidate",
     "send_watchdog",
 ]
 
@@ -534,3 +535,129 @@ def send_watchdog(
     )
     _post_with_retry(webhook_url, payload, cfg)
     logger.info("Watchdog alert delivered")
+
+
+# ---------------------------------------------------------------------------
+# Ranked candidate embed (v2 composite-rank pipeline)
+# ---------------------------------------------------------------------------
+
+
+def _format_market_cap(market_cap: float | None) -> str:
+    """Format market cap as human-readable string."""
+    if market_cap is None:
+        return "N/A"
+    if market_cap >= 1e12:
+        return f"${market_cap / 1e12:.1f}T"
+    if market_cap >= 1e9:
+        return f"${market_cap / 1e9:.1f}B"
+    if market_cap >= 1e6:
+        return f"${market_cap / 1e6:.1f}M"
+    return f"${market_cap:,.0f}"
+
+
+def _build_ranked_candidate_embed(candidate: Any) -> dict[str, Any]:
+    """Green embed for one ranked candidate.
+
+    Fields:
+      - Rank: #N in {sector}
+      - Composite Score: 2.34
+      - Value / Quality / Reversal: 1.2 / 0.8 / 0.3
+      - Close: $142.50
+      - Market Cap: $45.2B
+      - Latest Catalyst: [headline](url)
+
+    Footer: "Composite rank — for human review"
+    """
+    fields: list[dict[str, Any]] = [
+        {
+            "name": "Rank",
+            "value": f"#{candidate.composite_rank} in {candidate.sector}",
+            "inline": True,
+        },
+        {
+            "name": "Composite Score",
+            "value": f"{candidate.composite_score:.3f}",
+            "inline": True,
+        },
+        {
+            "name": "Value / Quality / Reversal",
+            "value": (
+                f"{candidate.value_composite:.3f} / "
+                f"{candidate.quality_composite:.3f} / "
+                f"{candidate.reversal_signal:.3f}"
+            ),
+            "inline": True,
+        },
+        {
+            "name": "Close",
+            "value": f"${candidate.close:,.2f}",
+            "inline": True,
+        },
+        {
+            "name": "Market Cap",
+            "value": _format_market_cap(candidate.market_cap),
+            "inline": True,
+        },
+    ]
+
+    # Latest catalyst — only include if we actually have a headline.
+    if candidate.latest_headline:
+        if candidate.headline_url:
+            catalyst_value = (
+                f"[{candidate.latest_headline}]({candidate.headline_url})"
+            )
+        else:
+            catalyst_value = candidate.latest_headline
+        fields.append(
+            {
+                "name": "Latest Catalyst",
+                "value": _truncate(catalyst_value),
+                "inline": False,
+            }
+        )
+
+    return {
+        "title": f"\U0001F4CA Ranked: {candidate.ticker}",
+        "url": _yahoo_finance_url(candidate.ticker),
+        "color": _COLOR_HIGH_CONVICTION,
+        "fields": fields,
+        "footer": {
+            "text": "Composite rank \u2014 for human review",
+        },
+        "timestamp": _utc_now_iso(),
+    }
+
+
+def send_ranked_candidate(
+    candidate: Any,
+    webhook_url: str,
+    cfg: NotificationConfig,
+) -> None:
+    """Post a ranked candidate rich embed for one :class:`RankedCandidate`.
+
+    Implements Requirements 5.4, 5.8.
+
+    Args:
+        candidate: The RankedCandidate to alert on.
+        webhook_url: Discord webhook URL.
+        cfg: ``AppConfig.notification`` — supplies ``bot_username`` and
+            retry budget.
+
+    Raises:
+        NotificationError: On non-retryable 4xx or after the retry budget
+            for 429 / 5xx is exhausted.
+    """
+    payload = {
+        "username": cfg.bot_username,
+        "embeds": [_build_ranked_candidate_embed(candidate)],
+    }
+
+    logger.info(
+        "Posting ranked candidate alert to Discord webhook for ticker=%s",
+        candidate.ticker,
+    )
+    _post_with_retry(webhook_url, payload, cfg)
+    logger.info(
+        "Ranked candidate alert delivered for ticker=%s",
+        candidate.ticker,
+    )

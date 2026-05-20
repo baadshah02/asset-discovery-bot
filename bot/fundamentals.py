@@ -26,6 +26,7 @@ import logging
 import math
 import threading
 import time
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from statistics import mean
 from typing import Any, Iterable
@@ -38,11 +39,13 @@ from bot.repo import Fundamentals, Repository  # noqa: F401
 
 __all__ = [
     "EdgarRateLimiter",
+    "ExtendedFundamentals",
     "Fundamentals",
     "FundamentalsBudgetExhausted",
     "FundamentalsClient",
     "FmpBudgetExhausted",
     "FmpClient",
+    "get_extended_fundamentals",
     "get_fundamentals",
 ]
 
@@ -51,6 +54,44 @@ _log = logging.getLogger(__name__)
 # The SEC asks every CompanyFacts consumer to identify themselves in the
 # User-Agent. Requests without a recognisable UA return 403.
 _EDGAR_UA = "asset-discovery-bot bot@asset-discovery-bot.local"
+
+
+# ---------------------------------------------------------------------------
+# ExtendedFundamentals — v2 dataclass for composite scoring
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ExtendedFundamentals:
+    """Extended record from EDGAR with all fields needed by the composite scorer.
+
+    Carries all v1 fields plus the additional metrics required for
+    Value_Composite, Quality_Composite, and Reversal_Signal computation.
+    """
+
+    ticker: str
+    # v1 fields (preserved)
+    pe_ratio: float | None
+    pe_5y_avg: float | None
+    fcf_yield: float | None
+    latest_headline: str | None
+    headline_url: str | None
+    fetched_at: datetime
+    # v2 extended fields
+    total_debt: float | None
+    cash_and_equivalents: float | None
+    ebit: float | None
+    revenue_ttm: float | None
+    book_value_of_equity: float | None
+    dividends_paid_ttm: float | None
+    share_buybacks_ttm: float | None
+    cogs_ttm: float | None
+    total_assets: float | None
+    annual_eps_5y: list[float] | None  # up to 5 annual EPS values
+    net_income_ttm: float | None
+    operating_cash_flow_ttm: float | None
+    market_cap: float | None
+    schema_version: int = 2
 
 
 class EdgarRateLimiter:
@@ -203,6 +244,59 @@ _CONCEPT_CAPEX = (
 _CONCEPT_SHARES_OUTSTANDING = (
     "CommonStockSharesOutstanding",
     "dei:EntityCommonStockSharesOutstanding",
+)
+
+# v2 extended concept mappings for composite scoring
+_CONCEPT_TOTAL_DEBT = (
+    "LongTermDebt",
+    "LongTermDebtNoncurrent",
+    "DebtCurrent",
+)
+_CONCEPT_SHORT_TERM_DEBT = (
+    "ShortTermBorrowings",
+    "DebtCurrent",
+)
+_CONCEPT_CASH = (
+    "CashAndCashEquivalentsAtCarryingValue",
+    "Cash",
+)
+_CONCEPT_EBIT = (
+    "OperatingIncomeLoss",
+    "IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest",
+)
+_CONCEPT_REVENUE = (
+    "Revenues",
+    "RevenueFromContractWithCustomerExcludingAssessedTax",
+)
+_CONCEPT_BOOK_VALUE = (
+    "StockholdersEquity",
+    "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest",
+)
+_CONCEPT_DIVIDENDS = (
+    "PaymentsOfDividends",
+    "PaymentsOfDividendsCommonStock",
+)
+_CONCEPT_BUYBACKS = (
+    "PaymentsForRepurchaseOfCommonStock",
+    "PaymentsForRepurchaseOfEquity",
+)
+_CONCEPT_COGS = (
+    "CostOfGoodsAndServicesSold",
+    "CostOfRevenue",
+)
+_CONCEPT_TOTAL_ASSETS = (
+    "Assets",
+)
+_CONCEPT_NET_INCOME = (
+    "NetIncomeLoss",
+    "ProfitLoss",
+)
+_CONCEPT_INTEREST_EXPENSE = (
+    "InterestExpense",
+    "InterestExpenseDebt",
+)
+_CONCEPT_TAX_EXPENSE = (
+    "IncomeTaxExpenseBenefit",
 )
 
 
@@ -566,6 +660,204 @@ class FundamentalsClient:
 
         return result
 
+    def fetch_extended(self, ticker: str) -> dict[str, Any]:
+        """Fetch all v1 + v2 extended fields for one ticker.
+
+        Returns a dict with all keys from :meth:`fetch` plus the extended
+        fields needed by the composite scorer: ``total_debt``,
+        ``cash_and_equivalents``, ``ebit``, ``revenue_ttm``,
+        ``book_value_of_equity``, ``dividends_paid_ttm``,
+        ``share_buybacks_ttm``, ``cogs_ttm``, ``total_assets``,
+        ``annual_eps_5y``, ``net_income_ttm``, ``operating_cash_flow_ttm``.
+        Any key may be ``None`` if the XBRL data is unavailable.
+        """
+        # Start with v1 fields
+        result: dict[str, Any] = {
+            "pe_ratio": None,
+            "pe_5y_avg": None,
+            "fcf_yield": None,
+            "market_cap": None,
+            "latest_headline": None,
+            "headline_url": None,
+            # v2 extended fields
+            "total_debt": None,
+            "cash_and_equivalents": None,
+            "ebit": None,
+            "revenue_ttm": None,
+            "book_value_of_equity": None,
+            "dividends_paid_ttm": None,
+            "share_buybacks_ttm": None,
+            "cogs_ttm": None,
+            "total_assets": None,
+            "annual_eps_5y": None,
+            "net_income_ttm": None,
+            "operating_cash_flow_ttm": None,
+        }
+
+        # CIK lookup
+        self.call_count += 1
+        self._acquire_edgar_slot()
+        cik = _cik_from_ticker(ticker)
+        if cik is None:
+            _log.warning("No SEC CIK for ticker=%s; skipping", ticker)
+            return result
+
+        # CompanyFacts
+        self.call_count += 1
+        self._acquire_edgar_slot()
+        facts = _edgar_company_facts(cik)
+        if facts is None:
+            return result
+
+        # --- v1 fields ---
+        eps_entries = _facts_for_concept(facts, _CONCEPT_EPS_DILUTED)
+        ttm_eps = _ttm_eps(eps_entries)
+        annual_eps = _annual_eps_by_fy(eps_entries)
+
+        ocf_entries = _facts_for_concept(facts, _CONCEPT_OPERATING_CASH_FLOW)
+        capex_entries = _facts_for_concept(facts, _CONCEPT_CAPEX)
+        ttm_ocf = _ttm_sum(ocf_entries)
+        ttm_capex = _ttm_sum(capex_entries)
+        ttm_fcf: float | None
+        if ttm_ocf is not None and ttm_capex is not None:
+            ttm_fcf = ttm_ocf - abs(ttm_capex)
+        else:
+            ttm_fcf = None
+
+        shares_entries = _facts_for_concept(facts, _CONCEPT_SHARES_OUTSTANDING)
+        shares_latest = _latest_quarterly(shares_entries, n=1)
+        shares_out = (
+            _parse_float(shares_latest[0].get("val")) if shares_latest else None
+        )
+
+        # Current price (yfinance)
+        self.call_count += 1
+        current_price = _current_price(ticker)
+
+        if (
+            shares_out is not None and shares_out > 0
+            and current_price is not None and current_price > 0
+        ):
+            result["market_cap"] = shares_out * current_price
+
+        if (
+            ttm_eps is not None and ttm_eps > 0
+            and current_price is not None and current_price > 0
+        ):
+            result["pe_ratio"] = current_price / ttm_eps
+
+        if (
+            ttm_fcf is not None
+            and result["market_cap"] is not None
+            and result["market_cap"] > 0
+        ):
+            result["fcf_yield"] = ttm_fcf / result["market_cap"]
+
+        if annual_eps:
+            self.call_count += 1
+            historical = _historical_closes(ticker)
+            result["pe_5y_avg"] = _pe_5y_avg_from_eps_and_price(
+                annual_eps, historical
+            )
+
+        # Latest headline
+        self.call_count += 1
+        title, url = _latest_headline(ticker)
+        result["latest_headline"] = title
+        result["headline_url"] = url
+
+        # --- v2 extended fields ---
+
+        # Total debt: LongTermDebt + ShortTermBorrowings (fallback variants)
+        long_term_entries = _facts_for_concept(facts, _CONCEPT_TOTAL_DEBT)
+        short_term_entries = _facts_for_concept(facts, _CONCEPT_SHORT_TERM_DEBT)
+        lt_val = _parse_float(
+            _latest_quarterly(long_term_entries, n=1)[0].get("val")
+        ) if _latest_quarterly(long_term_entries, n=1) else None
+        st_val = _parse_float(
+            _latest_quarterly(short_term_entries, n=1)[0].get("val")
+        ) if _latest_quarterly(short_term_entries, n=1) else None
+        if lt_val is not None or st_val is not None:
+            result["total_debt"] = (lt_val or 0.0) + (st_val or 0.0)
+
+        # Cash and equivalents
+        cash_entries = _facts_for_concept(facts, _CONCEPT_CASH)
+        cash_latest = _latest_quarterly(cash_entries, n=1)
+        if cash_latest:
+            result["cash_and_equivalents"] = _parse_float(
+                cash_latest[0].get("val")
+            )
+
+        # EBIT (OperatingIncomeLoss, fallback to computed)
+        ebit_entries = _facts_for_concept(facts, _CONCEPT_EBIT)
+        ebit_val = _parse_float(
+            _latest_quarterly(ebit_entries, n=1)[0].get("val")
+        ) if _latest_quarterly(ebit_entries, n=1) else None
+        if ebit_val is not None:
+            result["ebit"] = ebit_val
+        else:
+            # Fallback: NetIncome + InterestExpense + TaxExpense
+            ni_entries = _facts_for_concept(facts, _CONCEPT_NET_INCOME)
+            int_entries = _facts_for_concept(facts, _CONCEPT_INTEREST_EXPENSE)
+            tax_entries = _facts_for_concept(facts, _CONCEPT_TAX_EXPENSE)
+            ni_val = _parse_float(
+                _latest_quarterly(ni_entries, n=1)[0].get("val")
+            ) if _latest_quarterly(ni_entries, n=1) else None
+            int_val = _parse_float(
+                _latest_quarterly(int_entries, n=1)[0].get("val")
+            ) if _latest_quarterly(int_entries, n=1) else None
+            tax_val = _parse_float(
+                _latest_quarterly(tax_entries, n=1)[0].get("val")
+            ) if _latest_quarterly(tax_entries, n=1) else None
+            if ni_val is not None and int_val is not None and tax_val is not None:
+                result["ebit"] = ni_val + int_val + tax_val
+
+        # Revenue TTM
+        rev_entries = _facts_for_concept(facts, _CONCEPT_REVENUE)
+        result["revenue_ttm"] = _ttm_sum(rev_entries)
+
+        # Book value of equity
+        bv_entries = _facts_for_concept(facts, _CONCEPT_BOOK_VALUE)
+        bv_latest = _latest_quarterly(bv_entries, n=1)
+        if bv_latest:
+            result["book_value_of_equity"] = _parse_float(
+                bv_latest[0].get("val")
+            )
+
+        # Dividends paid TTM
+        div_entries = _facts_for_concept(facts, _CONCEPT_DIVIDENDS)
+        result["dividends_paid_ttm"] = _ttm_sum(div_entries)
+
+        # Share buybacks TTM
+        bb_entries = _facts_for_concept(facts, _CONCEPT_BUYBACKS)
+        result["share_buybacks_ttm"] = _ttm_sum(bb_entries)
+
+        # COGS TTM
+        cogs_entries = _facts_for_concept(facts, _CONCEPT_COGS)
+        result["cogs_ttm"] = _ttm_sum(cogs_entries)
+
+        # Total assets (latest quarter)
+        assets_entries = _facts_for_concept(facts, _CONCEPT_TOTAL_ASSETS)
+        assets_latest = _latest_quarterly(assets_entries, n=1)
+        if assets_latest:
+            result["total_assets"] = _parse_float(
+                assets_latest[0].get("val")
+            )
+
+        # Annual EPS 5y (list of up to 5 annual EPS values, newest first)
+        if annual_eps:
+            years_sorted = sorted(annual_eps.keys(), reverse=True)[:5]
+            result["annual_eps_5y"] = [annual_eps[y] for y in years_sorted]
+
+        # Net income TTM
+        ni_entries_ttm = _facts_for_concept(facts, _CONCEPT_NET_INCOME)
+        result["net_income_ttm"] = _ttm_sum(ni_entries_ttm)
+
+        # Operating cash flow TTM (already computed above for FCF)
+        result["operating_cash_flow_ttm"] = ttm_ocf
+
+        return result
+
 
 # Legacy alias so ``from bot.fundamentals import FmpClient`` keeps working.
 FmpClient = FundamentalsClient
@@ -641,3 +933,143 @@ def get_fundamentals(
     )
     repo.upsert_fundamentals(fresh)
     return fresh
+
+
+# ---------------------------------------------------------------------------
+# Extended fundamentals — cache-gated fetch for composite-rank pipeline
+# ---------------------------------------------------------------------------
+
+
+def get_extended_fundamentals(
+    ticker: str,
+    repo: Repository,
+    fmp_client: FundamentalsClient,
+    staleness_days: int,
+    pipeline_mode: str = "composite_rank",
+) -> ExtendedFundamentals:
+    """Cache-gated extended fundamentals fetch for one ticker.
+
+    When ``pipeline_mode = composite_rank`` and the cached row has
+    ``fundamentals_schema_version < 2``, the row is treated as stale
+    and refetched (Requirement 8.6).
+
+    Returns an :class:`ExtendedFundamentals` record with all fields
+    populated (any may be None if EDGAR data is unavailable).
+    """
+    now = datetime.now(timezone.utc)
+    freshness = timedelta(days=staleness_days)
+
+    # Check cache
+    cached_row = repo.load_extended_fundamentals(ticker)
+    if cached_row is not None:
+        fetched_at = cached_row.get("fetched_at")
+        if fetched_at is not None:
+            if hasattr(fetched_at, "tzinfo") and fetched_at.tzinfo is None:
+                fetched_at = fetched_at.replace(tzinfo=timezone.utc)
+            schema_version = cached_row.get("fundamentals_schema_version", 1)
+            is_fresh = (now - fetched_at) < freshness
+            # In composite_rank mode, v1 rows (schema_version < 2) are stale
+            schema_ok = (
+                pipeline_mode != "composite_rank" or schema_version >= 2
+            )
+            if is_fresh and schema_ok:
+                return _row_to_extended_fundamentals(ticker, cached_row)
+
+    if fmp_client.budget_exhausted:
+        if cached_row is not None:
+            _log.info(
+                "Fundamentals budget exhausted; serving stale cache for %s",
+                ticker,
+            )
+            return _row_to_extended_fundamentals(ticker, cached_row)
+        raise FundamentalsBudgetExhausted(
+            f"No cached fundamentals for {ticker!r} and budget exhausted"
+        )
+
+    try:
+        fields = fmp_client.fetch_extended(ticker)
+    except FundamentalsBudgetExhausted:
+        if cached_row is not None:
+            _log.info(
+                "Budget exhausted mid-fetch for %s; serving stale cache",
+                ticker,
+            )
+            return _row_to_extended_fundamentals(ticker, cached_row)
+        raise
+
+    # Upsert with schema_version = 2
+    upsert_fields: dict[str, Any] = {
+        "pe_ratio": fields.get("pe_ratio"),
+        "pe_5y_avg": fields.get("pe_5y_avg"),
+        "fcf_yield": fields.get("fcf_yield"),
+        "latest_headline": fields.get("latest_headline"),
+        "headline_url": fields.get("headline_url"),
+        "fetched_at": now,
+        "total_debt": fields.get("total_debt"),
+        "cash_and_equivalents": fields.get("cash_and_equivalents"),
+        "ebit": fields.get("ebit"),
+        "revenue_ttm": fields.get("revenue_ttm"),
+        "book_value_of_equity": fields.get("book_value_of_equity"),
+        "dividends_paid_ttm": fields.get("dividends_paid_ttm"),
+        "share_buybacks_ttm": fields.get("share_buybacks_ttm"),
+        "cogs_ttm": fields.get("cogs_ttm"),
+        "total_assets": fields.get("total_assets"),
+        "annual_eps_5y": fields.get("annual_eps_5y"),
+        "net_income_ttm": fields.get("net_income_ttm"),
+        "operating_cash_flow_ttm": fields.get("operating_cash_flow_ttm"),
+        "fundamentals_schema_version": 2,
+    }
+    repo.upsert_extended_fundamentals(ticker, upsert_fields)
+
+    return ExtendedFundamentals(
+        ticker=ticker,
+        pe_ratio=fields.get("pe_ratio"),
+        pe_5y_avg=fields.get("pe_5y_avg"),
+        fcf_yield=fields.get("fcf_yield"),
+        latest_headline=fields.get("latest_headline"),
+        headline_url=fields.get("headline_url"),
+        fetched_at=now,
+        total_debt=fields.get("total_debt"),
+        cash_and_equivalents=fields.get("cash_and_equivalents"),
+        ebit=fields.get("ebit"),
+        revenue_ttm=fields.get("revenue_ttm"),
+        book_value_of_equity=fields.get("book_value_of_equity"),
+        dividends_paid_ttm=fields.get("dividends_paid_ttm"),
+        share_buybacks_ttm=fields.get("share_buybacks_ttm"),
+        cogs_ttm=fields.get("cogs_ttm"),
+        total_assets=fields.get("total_assets"),
+        annual_eps_5y=fields.get("annual_eps_5y"),
+        net_income_ttm=fields.get("net_income_ttm"),
+        operating_cash_flow_ttm=fields.get("operating_cash_flow_ttm"),
+        market_cap=fields.get("market_cap"),
+        schema_version=2,
+    )
+
+
+def _row_to_extended_fundamentals(
+    ticker: str, row: dict[str, Any]
+) -> ExtendedFundamentals:
+    """Convert a cached DB row dict to an ExtendedFundamentals dataclass."""
+    return ExtendedFundamentals(
+        ticker=ticker,
+        pe_ratio=row.get("pe_ratio"),
+        pe_5y_avg=row.get("pe_5y_avg"),
+        fcf_yield=row.get("fcf_yield"),
+        latest_headline=row.get("latest_headline"),
+        headline_url=row.get("headline_url"),
+        fetched_at=row.get("fetched_at", datetime.now(timezone.utc)),
+        total_debt=row.get("total_debt"),
+        cash_and_equivalents=row.get("cash_and_equivalents"),
+        ebit=row.get("ebit"),
+        revenue_ttm=row.get("revenue_ttm"),
+        book_value_of_equity=row.get("book_value_of_equity"),
+        dividends_paid_ttm=row.get("dividends_paid_ttm"),
+        share_buybacks_ttm=row.get("share_buybacks_ttm"),
+        cogs_ttm=row.get("cogs_ttm"),
+        total_assets=row.get("total_assets"),
+        annual_eps_5y=row.get("annual_eps_5y"),
+        net_income_ttm=row.get("net_income_ttm"),
+        operating_cash_flow_ttm=row.get("operating_cash_flow_ttm"),
+        market_cap=row.get("market_cap"),
+        schema_version=row.get("fundamentals_schema_version", 1),
+    )

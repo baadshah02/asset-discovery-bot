@@ -120,3 +120,35 @@ logging:
   log_dir: "/var/log/asset-discovery-bot"
   max_file_size_mb: 10
   backup_count: 7
+
+# --- Composite-Rank Pipeline (v2) ---
+# These sections are used when pipeline.mode = "composite_rank".
+# When pipeline.mode = "hard_threshold" (default), these are ignored.
+
+# Pipeline mode: "hard_threshold" (v1 default) or "composite_rank" (v2)
+pipeline:
+  mode: "hard_threshold"
+
+# Composite scoring weights (applied to z-score composites)
+# At least one weight must be non-zero.
+scoring:
+  value_weight: 1.0       # Weight for Value_Composite [0.0, 10.0]
+  quality_weight: 1.0     # Weight for Quality_Composite [0.0, 10.0]
+  reversal_weight: 0.5    # Weight for Reversal_Signal [0.0, 10.0]
+
+# Ranking and top-N selection
+ranking:
+  sector_neutral: true    # z-score within GICS sector
+  top_n: 20              # Cross-sectional top-N (when sector_neutral=false) [1, 500]
+  top_n_per_sector: 2    # Per-sector top-N (when sector_neutral=true) [1, 50]
+  min_sector_size: 5     # Minimum tickers for sector-neutral z-scoring [1, 50]
+
+# Short-term reversal signal (Jegadeesh 1990)
+reversal:
+  enabled: true
+  lookback_days: 21      # Trading days for trailing return [5, 252]
+
+# Note: Composite-rank alerts can optionally go to a separate Discord
+# channel by creating a secrets/discord_composite_webhook_url.txt file
+# with the webhook URL. If empty or missing, alerts use the primary
+# discord_webhook_url.
