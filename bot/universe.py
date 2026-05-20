@@ -275,7 +275,7 @@ def fetch_current_constituents(
     if header_row is None:
         raise ValueError("Constituents table has no rows")
     headers = [
-        _cell_text(th).strip().lower()
+        th.get_text(strip=True).lower()
         for th in header_row.find_all(["th", "td"])
     ]
 
@@ -289,7 +289,7 @@ def fetch_current_constituents(
 
     symbol_idx = _column_index("symbol", "ticker")
     name_idx = _column_index("security", "company")
-    sector_idx = _column_index("gics sector", "sector")
+    sector_idx = _column_index("gics sector", "gicssector", "gics", "sector")
 
     if symbol_idx is None or name_idx is None:
         raise ValueError(

@@ -456,6 +456,18 @@ def _current_price(symbol: str) -> float | None:
     return _parse_float(hist["Close"].iloc[-1])
 
 
+def _yf_market_cap(symbol: str) -> float | None:
+    """Market cap directly from yfinance (handles dual-class correctly)."""
+    try:
+        t = _yf_ticker(symbol)
+        mc = t.fast_info.get("marketCap") or t.fast_info.get("market_cap")
+        if mc is not None and mc > 0:
+            return float(mc)
+    except Exception as exc:  # noqa: BLE001
+        _log.debug("yfinance market_cap failed for %s: %s", symbol, exc)
+    return None
+
+
 def _historical_closes(symbol: str):
     """~6 years of daily closes as a pandas Series, or None."""
     try:
@@ -654,23 +666,25 @@ class FundamentalsClient:
         else:
             ttm_fcf = None
 
-        # Shares outstanding
-        shares_entries = _facts_for_concept(facts, _CONCEPT_SHARES_OUTSTANDING, preferred_unit="shares")
-        shares_latest = _latest_quarterly(shares_entries, n=1, include_fy=True)
-        shares_out = (
-            _parse_float(shares_latest[0].get("val")) if shares_latest else None
-        )
-
-        # Current price (yfinance)
+        # Market cap from yfinance (handles dual-class correctly)
         self.call_count += 1
         current_price = _current_price(ticker)
-
-        # Derivations
-        if (
-            shares_out is not None and shares_out > 0
-            and current_price is not None and current_price > 0
-        ):
-            result["market_cap"] = shares_out * current_price
+        self.call_count += 1
+        yf_mcap = _yf_market_cap(ticker)
+        if yf_mcap is not None:
+            result["market_cap"] = yf_mcap
+        else:
+            # Fallback: EDGAR shares * price (may be wrong for dual-class)
+            shares_entries = _facts_for_concept(facts, _CONCEPT_SHARES_OUTSTANDING, preferred_unit="shares")
+            shares_latest = _latest_quarterly(shares_entries, n=1, include_fy=True)
+            shares_out = (
+                _parse_float(shares_latest[0].get("val")) if shares_latest else None
+            )
+            if (
+                shares_out is not None and shares_out > 0
+                and current_price is not None and current_price > 0
+            ):
+                result["market_cap"] = shares_out * current_price
 
         if (
             ttm_eps is not None and ttm_eps > 0
@@ -773,21 +787,25 @@ class FundamentalsClient:
         else:
             ttm_fcf = None
 
-        shares_entries = _facts_for_concept(facts, _CONCEPT_SHARES_OUTSTANDING, preferred_unit="shares")
-        shares_latest = _latest_quarterly(shares_entries, n=1, include_fy=True)
-        shares_out = (
-            _parse_float(shares_latest[0].get("val")) if shares_latest else None
-        )
-
-        # Current price (yfinance)
+        # Market cap from yfinance (handles dual-class correctly)
         self.call_count += 1
         current_price = _current_price(ticker)
-
-        if (
-            shares_out is not None and shares_out > 0
-            and current_price is not None and current_price > 0
-        ):
-            result["market_cap"] = shares_out * current_price
+        self.call_count += 1
+        yf_mcap = _yf_market_cap(ticker)
+        if yf_mcap is not None:
+            result["market_cap"] = yf_mcap
+        else:
+            # Fallback: EDGAR shares * price (may be wrong for dual-class)
+            shares_entries = _facts_for_concept(facts, _CONCEPT_SHARES_OUTSTANDING, preferred_unit="shares")
+            shares_latest = _latest_quarterly(shares_entries, n=1, include_fy=True)
+            shares_out = (
+                _parse_float(shares_latest[0].get("val")) if shares_latest else None
+            )
+            if (
+                shares_out is not None and shares_out > 0
+                and current_price is not None and current_price > 0
+            ):
+                result["market_cap"] = shares_out * current_price
 
         if (
             ttm_eps is not None and ttm_eps > 0
