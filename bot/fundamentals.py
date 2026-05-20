@@ -303,6 +303,7 @@ _CONCEPT_TAX_EXPENSE = (
 def _facts_for_concept(
     company_facts: dict[str, Any],
     concept_candidates: Iterable[str],
+    preferred_unit: str | None = None,
 ) -> list[dict[str, Any]]:
     """Return entries for the first concept that resolves (us-gaap, then dei).
 
@@ -310,9 +311,11 @@ def _facts_for_concept(
 
         { "facts": { "us-gaap": { "<Concept>": { "units": { "USD": [...] } } } } }
 
-    ``dei:Foo`` in the candidate list forces that taxonomy. All unit
-    variants are flattened; the caller already knows which concept they
-    asked for and hence which unit to expect.
+    ``dei:Foo`` in the candidate list forces that taxonomy.
+
+    When *preferred_unit* is given (e.g. ``"USD"`` or ``"shares"``),
+    only that unit key is considered. If missing, falls back to the
+    first non-empty unit (legacy behaviour).
     """
     facts_root = company_facts.get("facts") or {}
     taxonomies = ("us-gaap", "dei")
@@ -325,15 +328,29 @@ def _facts_for_concept(
         for taxonomy, concept_name in scopes:
             block = (facts_root.get(taxonomy) or {}).get(concept_name) or {}
             units = block.get("units") or {}
-            for entries in units.values():
+            if preferred_unit:
+                entries = units.get(preferred_unit)
                 if entries:
                     return list(entries)
+            else:
+                for entries in units.values():
+                    if entries:
+                        return list(entries)
     return []
 
 
-def _latest_quarterly(entries: list[dict[str, Any]], n: int) -> list[dict[str, Any]]:
-    """Newest-first ``n`` entries deduped on ``end`` (amendments preserved)."""
-    filtered = [e for e in entries if e.get("fp") in {"Q1", "Q2", "Q3", "FY"}]
+def _latest_quarterly(
+    entries: list[dict[str, Any]], n: int, *, include_fy: bool = False
+) -> list[dict[str, Any]]:
+    """Newest-first ``n`` entries deduped on ``end``.
+
+    When *include_fy* is False (default), FY entries are excluded to
+    prevent double-counting when summing quarters for TTM.
+    """
+    allowed_fps = {"Q1", "Q2", "Q3", "Q4"}
+    if include_fy:
+        allowed_fps.add("FY")
+    filtered = [e for e in entries if e.get("fp") in allowed_fps]
     filtered.sort(
         key=lambda e: (str(e.get("end", "")), str(e.get("filed", ""))),
         reverse=True,
@@ -350,8 +367,27 @@ def _latest_quarterly(entries: list[dict[str, Any]], n: int) -> list[dict[str, A
 
 
 def _ttm_sum(entries: list[dict[str, Any]]) -> float | None:
-    """Sum the ``val`` across 4 newest quarters; None if <4 quarters."""
-    quarters = _latest_quarterly(entries, n=4)
+    """Compute trailing twelve months value.
+
+    Strategy:
+      1. If a recent FY (full-year) entry exists, use it directly.
+      2. Otherwise sum the 4 newest quarterly entries.
+
+    This avoids double-counting where FY already includes Q1–Q4.
+    """
+    # Try FY first — most accurate single value for TTM
+    fy_entries = [e for e in entries if e.get("fp") == "FY"]
+    if fy_entries:
+        fy_entries.sort(
+            key=lambda e: (str(e.get("end", "")), str(e.get("filed", ""))),
+            reverse=True,
+        )
+        val = _parse_float(fy_entries[0].get("val"))
+        if val is not None:
+            return val
+
+    # Fall back to summing 4 quarters (excluding FY to avoid double-count)
+    quarters = _latest_quarterly(entries, n=4, include_fy=False)
     if len(quarters) < 4:
         return None
     values = [_parse_float(q.get("val")) for q in quarters]
@@ -364,11 +400,18 @@ def _ttm_eps(eps_entries: list[dict[str, Any]]) -> float | None:
     """TTM diluted EPS: prefer newest FY, else sum of 4 newest quarters."""
     if not eps_entries:
         return None
-    quarters = _latest_quarterly(eps_entries, n=4)
-    if not quarters:
-        return None
-    if quarters[0].get("fp") == "FY":
-        return _parse_float(quarters[0].get("val"))
+    # Prefer FY entry (already a full-year figure)
+    fy_entries = [e for e in eps_entries if e.get("fp") == "FY"]
+    if fy_entries:
+        fy_entries.sort(
+            key=lambda e: (str(e.get("end", "")), str(e.get("filed", ""))),
+            reverse=True,
+        )
+        val = _parse_float(fy_entries[0].get("val"))
+        if val is not None:
+            return val
+    # Fall back to summing 4 quarters
+    quarters = _latest_quarterly(eps_entries, n=4, include_fy=False)
     if len(quarters) < 4:
         return None
     values = [_parse_float(q.get("val")) for q in quarters]
@@ -596,26 +639,24 @@ class FundamentalsClient:
             return result
 
         # TTM EPS + annual EPS history
-        eps_entries = _facts_for_concept(facts, _CONCEPT_EPS_DILUTED)
+        eps_entries = _facts_for_concept(facts, _CONCEPT_EPS_DILUTED, preferred_unit="USD/shares")
         ttm_eps = _ttm_eps(eps_entries)
         annual_eps = _annual_eps_by_fy(eps_entries)
 
         # TTM free cash flow
-        ocf_entries = _facts_for_concept(facts, _CONCEPT_OPERATING_CASH_FLOW)
-        capex_entries = _facts_for_concept(facts, _CONCEPT_CAPEX)
+        ocf_entries = _facts_for_concept(facts, _CONCEPT_OPERATING_CASH_FLOW, preferred_unit="USD")
+        capex_entries = _facts_for_concept(facts, _CONCEPT_CAPEX, preferred_unit="USD")
         ttm_ocf = _ttm_sum(ocf_entries)
         ttm_capex = _ttm_sum(capex_entries)
         ttm_fcf: float | None
         if ttm_ocf is not None and ttm_capex is not None:
-            # CapEx is reported as a positive magnitude; subtract abs to
-            # get FCF.
             ttm_fcf = ttm_ocf - abs(ttm_capex)
         else:
             ttm_fcf = None
 
         # Shares outstanding
-        shares_entries = _facts_for_concept(facts, _CONCEPT_SHARES_OUTSTANDING)
-        shares_latest = _latest_quarterly(shares_entries, n=1)
+        shares_entries = _facts_for_concept(facts, _CONCEPT_SHARES_OUTSTANDING, preferred_unit="shares")
+        shares_latest = _latest_quarterly(shares_entries, n=1, include_fy=True)
         shares_out = (
             _parse_float(shares_latest[0].get("val")) if shares_latest else None
         )
@@ -642,7 +683,15 @@ class FundamentalsClient:
             and result["market_cap"] is not None
             and result["market_cap"] > 0
         ):
-            result["fcf_yield"] = ttm_fcf / result["market_cap"]
+            raw_fcf_yield = ttm_fcf / result["market_cap"]
+            if abs(raw_fcf_yield) <= 10.0:
+                result["fcf_yield"] = raw_fcf_yield
+            else:
+                _log.warning(
+                    "Ticker %s: fcf_yield=%.4f implausible (unit mismatch?), "
+                    "setting to None",
+                    ticker, raw_fcf_yield,
+                )
 
         # 5y average P/E (needs historical prices + annual EPS)
         if annual_eps:
@@ -710,12 +759,12 @@ class FundamentalsClient:
             return result
 
         # --- v1 fields ---
-        eps_entries = _facts_for_concept(facts, _CONCEPT_EPS_DILUTED)
+        eps_entries = _facts_for_concept(facts, _CONCEPT_EPS_DILUTED, preferred_unit="USD/shares")
         ttm_eps = _ttm_eps(eps_entries)
         annual_eps = _annual_eps_by_fy(eps_entries)
 
-        ocf_entries = _facts_for_concept(facts, _CONCEPT_OPERATING_CASH_FLOW)
-        capex_entries = _facts_for_concept(facts, _CONCEPT_CAPEX)
+        ocf_entries = _facts_for_concept(facts, _CONCEPT_OPERATING_CASH_FLOW, preferred_unit="USD")
+        capex_entries = _facts_for_concept(facts, _CONCEPT_CAPEX, preferred_unit="USD")
         ttm_ocf = _ttm_sum(ocf_entries)
         ttm_capex = _ttm_sum(capex_entries)
         ttm_fcf: float | None
@@ -724,8 +773,8 @@ class FundamentalsClient:
         else:
             ttm_fcf = None
 
-        shares_entries = _facts_for_concept(facts, _CONCEPT_SHARES_OUTSTANDING)
-        shares_latest = _latest_quarterly(shares_entries, n=1)
+        shares_entries = _facts_for_concept(facts, _CONCEPT_SHARES_OUTSTANDING, preferred_unit="shares")
+        shares_latest = _latest_quarterly(shares_entries, n=1, include_fy=True)
         shares_out = (
             _parse_float(shares_latest[0].get("val")) if shares_latest else None
         )
@@ -751,7 +800,15 @@ class FundamentalsClient:
             and result["market_cap"] is not None
             and result["market_cap"] > 0
         ):
-            result["fcf_yield"] = ttm_fcf / result["market_cap"]
+            raw_fcf_yield = ttm_fcf / result["market_cap"]
+            if abs(raw_fcf_yield) <= 10.0:
+                result["fcf_yield"] = raw_fcf_yield
+            else:
+                _log.warning(
+                    "Ticker %s: fcf_yield=%.4f implausible (unit mismatch?), "
+                    "setting to None",
+                    ticker, raw_fcf_yield,
+                )
 
         if annual_eps:
             self.call_count += 1
@@ -769,76 +826,70 @@ class FundamentalsClient:
         # --- v2 extended fields ---
 
         # Total debt: LongTermDebt + ShortTermBorrowings (fallback variants)
-        long_term_entries = _facts_for_concept(facts, _CONCEPT_TOTAL_DEBT)
-        short_term_entries = _facts_for_concept(facts, _CONCEPT_SHORT_TERM_DEBT)
-        lt_val = _parse_float(
-            _latest_quarterly(long_term_entries, n=1)[0].get("val")
-        ) if _latest_quarterly(long_term_entries, n=1) else None
-        st_val = _parse_float(
-            _latest_quarterly(short_term_entries, n=1)[0].get("val")
-        ) if _latest_quarterly(short_term_entries, n=1) else None
+        long_term_entries = _facts_for_concept(facts, _CONCEPT_TOTAL_DEBT, preferred_unit="USD")
+        short_term_entries = _facts_for_concept(facts, _CONCEPT_SHORT_TERM_DEBT, preferred_unit="USD")
+        lt_latest = _latest_quarterly(long_term_entries, n=1, include_fy=True)
+        st_latest = _latest_quarterly(short_term_entries, n=1, include_fy=True)
+        lt_val = _parse_float(lt_latest[0].get("val")) if lt_latest else None
+        st_val = _parse_float(st_latest[0].get("val")) if st_latest else None
         if lt_val is not None or st_val is not None:
             result["total_debt"] = (lt_val or 0.0) + (st_val or 0.0)
 
         # Cash and equivalents
-        cash_entries = _facts_for_concept(facts, _CONCEPT_CASH)
-        cash_latest = _latest_quarterly(cash_entries, n=1)
+        cash_entries = _facts_for_concept(facts, _CONCEPT_CASH, preferred_unit="USD")
+        cash_latest = _latest_quarterly(cash_entries, n=1, include_fy=True)
         if cash_latest:
             result["cash_and_equivalents"] = _parse_float(
                 cash_latest[0].get("val")
             )
 
         # EBIT (OperatingIncomeLoss, fallback to computed)
-        ebit_entries = _facts_for_concept(facts, _CONCEPT_EBIT)
-        ebit_val = _parse_float(
-            _latest_quarterly(ebit_entries, n=1)[0].get("val")
-        ) if _latest_quarterly(ebit_entries, n=1) else None
+        ebit_entries = _facts_for_concept(facts, _CONCEPT_EBIT, preferred_unit="USD")
+        ebit_latest = _latest_quarterly(ebit_entries, n=1, include_fy=True)
+        ebit_val = _parse_float(ebit_latest[0].get("val")) if ebit_latest else None
         if ebit_val is not None:
             result["ebit"] = ebit_val
         else:
             # Fallback: NetIncome + InterestExpense + TaxExpense
-            ni_entries = _facts_for_concept(facts, _CONCEPT_NET_INCOME)
-            int_entries = _facts_for_concept(facts, _CONCEPT_INTEREST_EXPENSE)
-            tax_entries = _facts_for_concept(facts, _CONCEPT_TAX_EXPENSE)
-            ni_val = _parse_float(
-                _latest_quarterly(ni_entries, n=1)[0].get("val")
-            ) if _latest_quarterly(ni_entries, n=1) else None
-            int_val = _parse_float(
-                _latest_quarterly(int_entries, n=1)[0].get("val")
-            ) if _latest_quarterly(int_entries, n=1) else None
-            tax_val = _parse_float(
-                _latest_quarterly(tax_entries, n=1)[0].get("val")
-            ) if _latest_quarterly(tax_entries, n=1) else None
+            ni_entries = _facts_for_concept(facts, _CONCEPT_NET_INCOME, preferred_unit="USD")
+            int_entries = _facts_for_concept(facts, _CONCEPT_INTEREST_EXPENSE, preferred_unit="USD")
+            tax_entries = _facts_for_concept(facts, _CONCEPT_TAX_EXPENSE, preferred_unit="USD")
+            ni_latest = _latest_quarterly(ni_entries, n=1, include_fy=True)
+            int_latest = _latest_quarterly(int_entries, n=1, include_fy=True)
+            tax_latest = _latest_quarterly(tax_entries, n=1, include_fy=True)
+            ni_val = _parse_float(ni_latest[0].get("val")) if ni_latest else None
+            int_val = _parse_float(int_latest[0].get("val")) if int_latest else None
+            tax_val = _parse_float(tax_latest[0].get("val")) if tax_latest else None
             if ni_val is not None and int_val is not None and tax_val is not None:
                 result["ebit"] = ni_val + int_val + tax_val
 
         # Revenue TTM
-        rev_entries = _facts_for_concept(facts, _CONCEPT_REVENUE)
+        rev_entries = _facts_for_concept(facts, _CONCEPT_REVENUE, preferred_unit="USD")
         result["revenue_ttm"] = _ttm_sum(rev_entries)
 
         # Book value of equity
-        bv_entries = _facts_for_concept(facts, _CONCEPT_BOOK_VALUE)
-        bv_latest = _latest_quarterly(bv_entries, n=1)
+        bv_entries = _facts_for_concept(facts, _CONCEPT_BOOK_VALUE, preferred_unit="USD")
+        bv_latest = _latest_quarterly(bv_entries, n=1, include_fy=True)
         if bv_latest:
             result["book_value_of_equity"] = _parse_float(
                 bv_latest[0].get("val")
             )
 
         # Dividends paid TTM
-        div_entries = _facts_for_concept(facts, _CONCEPT_DIVIDENDS)
+        div_entries = _facts_for_concept(facts, _CONCEPT_DIVIDENDS, preferred_unit="USD")
         result["dividends_paid_ttm"] = _ttm_sum(div_entries)
 
         # Share buybacks TTM
-        bb_entries = _facts_for_concept(facts, _CONCEPT_BUYBACKS)
+        bb_entries = _facts_for_concept(facts, _CONCEPT_BUYBACKS, preferred_unit="USD")
         result["share_buybacks_ttm"] = _ttm_sum(bb_entries)
 
         # COGS TTM
-        cogs_entries = _facts_for_concept(facts, _CONCEPT_COGS)
+        cogs_entries = _facts_for_concept(facts, _CONCEPT_COGS, preferred_unit="USD")
         result["cogs_ttm"] = _ttm_sum(cogs_entries)
 
         # Total assets (latest quarter)
-        assets_entries = _facts_for_concept(facts, _CONCEPT_TOTAL_ASSETS)
-        assets_latest = _latest_quarterly(assets_entries, n=1)
+        assets_entries = _facts_for_concept(facts, _CONCEPT_TOTAL_ASSETS, preferred_unit="USD")
+        assets_latest = _latest_quarterly(assets_entries, n=1, include_fy=True)
         if assets_latest:
             result["total_assets"] = _parse_float(
                 assets_latest[0].get("val")
@@ -850,7 +901,7 @@ class FundamentalsClient:
             result["annual_eps_5y"] = [annual_eps[y] for y in years_sorted]
 
         # Net income TTM
-        ni_entries_ttm = _facts_for_concept(facts, _CONCEPT_NET_INCOME)
+        ni_entries_ttm = _facts_for_concept(facts, _CONCEPT_NET_INCOME, preferred_unit="USD")
         result["net_income_ttm"] = _ttm_sum(ni_entries_ttm)
 
         # Operating cash flow TTM (already computed above for FCF)
